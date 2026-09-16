@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository. Multi-agent claim, isolation, proof, and handoff rules live in `AGENTS.md` and https://github.com/ianrelecker/m365mcp/issues/21.
 
 ## What this is
 

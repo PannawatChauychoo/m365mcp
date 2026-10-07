@@ -500,3 +500,225 @@ def test_encode_share_url_matches_graph_addressing() -> None:
 
 def test_q_escapes_single_quote() -> None:
     assert SharePointFilesClient._q("it's a 'test'") == "it''s a ''test''"
+
+
+# --------------------------------------------------------------------------- #
+# get_file_content
+# --------------------------------------------------------------------------- #
+DOWNLOAD_URL = "https://contoso-my.sharepoint.com/download.aspx?tempauth=abc"
+
+
+def _docx_bytes() -> bytes:
+    import io
+
+    from docx import Document
+
+    document = Document()
+    document.add_heading("Investment Memo", level=0)
+    document.add_heading("Summary", level=1)
+    document.add_paragraph("Acme Apartments is a 240-unit property.")
+    document.add_paragraph("Strong submarket", style="List Bullet")
+    document.add_paragraph("Value-add upside", style="List Bullet")
+    document.add_heading("Returns", level=2)
+    table = document.add_table(rows=3, cols=2)
+    for row, values in zip(table.rows, [("Metric", "Value"), ("IRR", "15.2%"), ("Note", "A | B")]):
+        for cell, value in zip(row.cells, values):
+            cell.text = value
+    document.add_paragraph("Closing remarks.")
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def _file_handler(name: str, content: bytes, *, size: int | None = None, seen: list | None = None):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if seen is not None:
+            seen.append(request)
+        if request.url.host == "graph.microsoft.com":
+            assert request.url.path == "/v1.0/drives/drive-1/items/item-1"
+            assert "@microsoft.graph.downloadUrl" in request.url.params["$select"]
+            return httpx.Response(
+                200,
+                json={
+                    "id": "item-1",
+                    "name": name,
+                    "file": {"mimeType": "application/octet-stream"},
+                    "size": len(content) if size is None else size,
+                    "parentReference": {"driveId": "drive-1", "path": "/drive/root:/Deals"},
+                    "@microsoft.graph.downloadUrl": DOWNLOAD_URL,
+                },
+            )
+        assert str(request.url) == DOWNLOAD_URL
+        return httpx.Response(200, content=content)
+
+    return handler
+
+
+@pytest.mark.anyio
+async def test_get_file_content_reads_docx_as_markdown_without_token_on_download() -> None:
+    seen: list[httpx.Request] = []
+    client, http_client = _make_client(_file_handler("Memo.docx", _docx_bytes(), seen=seen))
+    result = await client.get_file_content(driveId="drive-1", itemId="item-1")
+
+    assert result.unsupportedReason is None
+    assert result.encoding == "docx-markdown"
+    assert result.item.name == "Memo.docx"
+    assert result.content == (
+        "# Investment Memo\n\n"
+        "# Summary\n\n"
+        "Acme Apartments is a 240-unit property.\n\n"
+        "- Strong submarket\n"
+        "- Value-add upside\n\n"
+        "## Returns\n\n"
+        "| Metric | Value |\n"
+        "| --- | --- |\n"
+        "| IRR | 15.2% |\n"
+        "| Note | A \\| B |\n\n"
+        "Closing remarks."
+    )
+    # The pre-authenticated download URL must never receive the bearer token.
+    assert seen[0].headers["authorization"] == "Bearer access-token"
+    assert "authorization" not in seen[1].headers
+    await http_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_get_file_content_reads_markdown_and_truncates_to_max_chars() -> None:
+    text = "﻿# Notes\n\nCafé — deal notes.\n".encode("utf-8")
+    client, http_client = _make_client(_file_handler("notes.md", text))
+    result = await client.get_file_content(driveId="drive-1", itemId="item-1", maxChars=7)
+
+    assert result.encoding == "utf-8"
+    assert result.content == "# Notes"
+    assert result.truncated is True
+    assert result.unsupportedReason is None
+    await http_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_get_file_content_extracts_pdf_text() -> None:
+    from tests.test_graph import _single_page_pdf
+
+    client, http_client = _make_client(
+        _file_handler("OM.pdf", _single_page_pdf(text=b"RENT ROLL", pages=2))
+    )
+    result = await client.get_file_content(driveId="drive-1", itemId="item-1")
+
+    assert result.encoding == "pdf-text"
+    assert "--- Page 1 ---\nRENT ROLL p1" in result.content
+    assert "--- Page 2 ---\nRENT ROLL p2" in result.content
+    await http_client.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("name", "reason_fragment"),
+    [
+        ("Model.xlsx", "workbook tools"),
+        ("Old.doc", "save the document as .docx"),
+        ("photo.png", ".png files are not readable"),
+    ],
+)
+async def test_get_file_content_refuses_unreadable_types_before_download(
+    name: str, reason_fragment: str
+) -> None:
+    seen: list[httpx.Request] = []
+    client, http_client = _make_client(_file_handler(name, b"bytes", seen=seen))
+    result = await client.get_file_content(driveId="drive-1", itemId="item-1")
+
+    assert result.content is None
+    assert reason_fragment in result.unsupportedReason
+    assert len(seen) == 1  # metadata only; nothing downloaded
+    await http_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_get_file_content_refuses_folders() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"id": "item-1", "name": "Deals", "folder": {"childCount": 3}})
+
+    client, http_client = _make_client(handler)
+    result = await client.get_file_content(driveId="drive-1", itemId="item-1")
+    assert "sharepoint_list_children" in result.unsupportedReason
+    await http_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_get_file_content_enforces_max_bytes_on_metadata_and_stream() -> None:
+    seen: list[httpx.Request] = []
+    client, http_client = _make_client(
+        _file_handler("big.txt", b"x" * 50, size=50, seen=seen)
+    )
+    by_size = await client.get_file_content(driveId="drive-1", itemId="item-1", maxBytes=10)
+    assert by_size.unsupportedReason == "File size exceeds maxBytes=10"
+    assert len(seen) == 1
+
+    # Metadata under-reports the size: the download stops once it passes maxBytes.
+    client, http_client2 = _make_client(_file_handler("big.txt", b"x" * 50, size=5))
+    by_stream = await client.get_file_content(driveId="drive-1", itemId="item-1", maxBytes=10)
+    assert by_stream.truncated is True
+    assert by_stream.content is None
+    assert by_stream.unsupportedReason == "File content exceeds maxBytes=10"
+    await http_client.aclose()
+    await http_client2.aclose()
+
+
+@pytest.mark.anyio
+async def test_get_file_content_follows_content_redirect_without_token() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path == "/v1.0/drives/drive-1/items/item-1":
+            return httpx.Response(200, json={"id": "item-1", "name": "readme.txt", "file": {}, "size": 5})
+        if request.url.path == "/v1.0/drives/drive-1/items/item-1/content":
+            assert request.headers["authorization"] == "Bearer access-token"
+            return httpx.Response(302, headers={"location": DOWNLOAD_URL})
+        assert str(request.url) == DOWNLOAD_URL
+        assert "authorization" not in request.headers
+        return httpx.Response(200, content=b"hello")
+
+    client, http_client = _make_client(handler)
+    result = await client.get_file_content(driveId="drive-1", itemId="item-1")
+    assert result.content == "hello"
+    assert len(seen) == 3
+    await http_client.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("name", "content", "reason_fragment"),
+    [
+        ("Memo.docx", b"\xd0\xcf\x11\xe0 not a zip", "not a valid .docx"),
+        ("Scan.pdf", None, "scanned PDFs need OCR"),
+    ],
+)
+async def test_get_file_content_reports_unreadable_documents(
+    name: str, content: bytes | None, reason_fragment: str
+) -> None:
+    if content is None:
+        from tests.test_graph import _single_page_pdf
+
+        content = _single_page_pdf(text=b"", pages=1).replace(b"( p1) Tj", b"() Tj")
+    client, http_client = _make_client(_file_handler(name, content))
+    result = await client.get_file_content(driveId="drive-1", itemId="item-1")
+    assert result.content is None
+    assert reason_fragment in result.unsupportedReason
+    await http_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_get_file_content_reports_download_errors() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "graph.microsoft.com":
+            return httpx.Response(
+                200,
+                json={"id": "item-1", "name": "a.txt", "file": {}, "size": 1,
+                      "@microsoft.graph.downloadUrl": DOWNLOAD_URL},
+            )
+        return httpx.Response(403, json={"error": {"code": "accessDenied", "message": "nope"}})
+
+    client, http_client = _make_client(handler)
+    with pytest.raises(RuntimeError, match=r"download failed \(403\): accessDenied: nope"):
+        await client.get_file_content(driveId="drive-1", itemId="item-1")
+    await http_client.aclose()

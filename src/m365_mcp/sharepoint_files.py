@@ -1,7 +1,8 @@
 """SharePoint / OneDrive browsing and sharing for the M365 MCP server.
 
-Lets Claude find folders anywhere the signed-in user has access and list their
-contents (Excel, PDF, etc.) — without mounting the folder locally. Pairs with
+Lets Claude find folders anywhere the signed-in user has access, list their
+contents (Excel, PDF, etc.), and read Word, PDF, and text files — without
+mounting the folder locally. Pairs with
 excel_workbook.py: use this to *locate* a workbook, then hand the returned
 driveId+itemId to the Workbook tools to edit it in place.
 
@@ -25,6 +26,9 @@ Endpoint reference (Graph v1.0):
     Search in a drive:   GET  /drives/{driveId}/root/search(q='{q}')
     Search everywhere:   POST /search/query   (entityTypes: driveItem)
     Resolve a link:      GET    /shares/{u!encoded}/driveItem
+    Read a file:         GET    /drives/{driveId}/items/{itemId}
+                                  ($select=...,@microsoft.graph.downloadUrl)
+                         then GET the pre-authenticated download URL
     List permissions:    GET    /drives/{driveId}/items/{itemId}/permissions
     Create link:         POST   /drives/{driveId}/items/{itemId}/createLink
     Grant access:        POST   /drives/{driveId}/items/{itemId}/invite
@@ -41,9 +45,20 @@ from urllib.parse import quote
 import httpx
 from pydantic import BaseModel, Field
 
+from .document_text import (
+    DocumentTextError,
+    decode_text,
+    extract_docx_markdown,
+    extract_pdf_text,
+    file_kind,
+    unreadable_reason,
+)
 from .microsoft_auth import MicrosoftAuthService
 
 GRAPH_V1 = "https://graph.microsoft.com/v1.0"
+DEFAULT_FILE_MAX_BYTES = 25_000_000
+DEFAULT_FILE_MAX_CHARS = 100_000
+_CONTENT_ENCODINGS = {"text": "utf-8", "word": "docx-markdown", "pdf": "pdf-text"}
 
 
 # --------------------------------------------------------------------------- #
@@ -92,6 +107,16 @@ class DriveItemsResult(BaseModel):
     path: str | None = None
     items: list[DriveItemInfo] = Field(default_factory=list)
     nextLink: str | None = None
+
+
+class DriveItemContentResult(BaseModel):
+    driveId: str
+    itemId: str
+    item: DriveItemInfo
+    content: str | None = None
+    encoding: str | None = None  # utf-8 | docx-markdown | pdf-text
+    truncated: bool = False
+    unsupportedReason: str | None = None
 
 
 class SharingIdentity(BaseModel):
@@ -300,6 +325,83 @@ class SharePointFilesClient:
         )
         parent = data.get("parentReference") or {}
         return self._map_item(data, parent.get("driveId"))
+
+    # ---- read ------------------------------------------------------------- #
+    async def get_file_content(
+        self,
+        *,
+        driveId: str,
+        itemId: str,
+        maxBytes: int = DEFAULT_FILE_MAX_BYTES,
+        maxChars: int = DEFAULT_FILE_MAX_CHARS,
+    ) -> DriveItemContentResult:
+        """Read a Word (.docx), PDF, or plain-text file as text.
+
+        Word comes back as Markdown, PDF as its per-page text layer, and text
+        files as-is. The file is checked by extension and size before it is
+        downloaded, and parsed in memory; nothing is saved.
+        """
+        if maxBytes < 1 or maxChars < 1:
+            raise ValueError("maxBytes and maxChars must be positive.")
+        data = await self._request(
+            f"{self._item_path(driveId, itemId)}"
+            "?$select=id,name,folder,file,size,webUrl,lastModifiedDateTime,"
+            "parentReference,@microsoft.graph.downloadUrl"
+        )
+        item = self._map_item(data, driveId)
+
+        def result(**fields: Any) -> DriveItemContentResult:
+            return DriveItemContentResult(
+                driveId=item.driveId or driveId, itemId=itemId, item=item, **fields
+            )
+
+        if item.isFolder:
+            return result(
+                unsupportedReason="Item is a folder; use sharepoint_list_children"
+            )
+        kind = file_kind(item.fileExtension)
+        if kind is None:
+            return result(unsupportedReason=unreadable_reason(item.fileExtension))
+        if item.size is not None and item.size > maxBytes:
+            return result(unsupportedReason=f"File size exceeds maxBytes={maxBytes}")
+
+        content_bytes = await self._download_bytes(
+            driveId=driveId,
+            itemId=itemId,
+            downloadUrl=data.get("@microsoft.graph.downloadUrl"),
+            maxBytes=maxBytes,
+        )
+        if content_bytes is None:
+            return result(
+                truncated=True,
+                unsupportedReason=f"File content exceeds maxBytes={maxBytes}",
+            )
+
+        encoding = _CONTENT_ENCODINGS[kind]
+        try:
+            if kind == "word":
+                content = extract_docx_markdown(content_bytes)
+            elif kind == "pdf":
+                content = extract_pdf_text(content_bytes)
+            else:
+                content = decode_text(content_bytes)
+        except DocumentTextError as error:
+            return result(encoding=encoding, unsupportedReason=str(error))
+
+        if kind != "text" and not content.strip():
+            return result(
+                encoding=encoding,
+                unsupportedReason=(
+                    "PDF did not contain extractable text; scanned PDFs need OCR"
+                    if kind == "pdf"
+                    else "Word document contains no text"
+                ),
+            )
+        return result(
+            content=content[:maxChars],
+            encoding=encoding,
+            truncated=len(content) > maxChars,
+        )
 
     # ---- sharing ---------------------------------------------------------- #
     async def list_permissions(
@@ -584,6 +686,56 @@ class SharePointFilesClient:
                 f"({response.status_code}): {detail}"
             )
         return data
+
+    async def _download_bytes(
+        self,
+        *,
+        driveId: str,
+        itemId: str,
+        downloadUrl: str | None,
+        maxBytes: int,
+    ) -> bytes | None:
+        """Download a file's bytes, or return None once it passes maxBytes.
+
+        The download URL Graph hands out is pre-authenticated and short-lived,
+        so the bearer token is never sent to it. Without one, /content answers
+        with a redirect to such a URL, which is followed the same way.
+        """
+        if downloadUrl:
+            url, headers = downloadUrl, {}
+        else:
+            access_token = await self._auth_service.get_access_token()
+            url = f"{GRAPH_V1}{self._item_path(driveId, itemId)}/content"
+            headers = {"Authorization": f"Bearer {access_token}"}
+        async with self._client() as client:
+            for _ in range(3):
+                async with client.stream("GET", url, headers=headers) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            break
+                        url, headers = location, {}
+                        continue
+                    if not response.is_success:
+                        await response.aread()
+                        try:
+                            detail = self._error_detail(response.json())
+                        except ValueError:
+                            detail = None
+                        raise RuntimeError(
+                            "Microsoft Graph Files download failed "
+                            f"({response.status_code}): "
+                            f"{detail or response.reason_phrase}"
+                        )
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in response.aiter_bytes():
+                        total += len(chunk)
+                        if total > maxBytes:
+                            return None
+                        chunks.append(chunk)
+                    return b"".join(chunks)
+        raise RuntimeError("Microsoft Graph Files download did not return the file.")
 
     @staticmethod
     def _error_detail(data: Any) -> str | None:

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import base64
 import io
+import re
 import warnings
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 from urllib.parse import quote
 
 import httpx
@@ -102,6 +103,15 @@ class _PdfRenderError(RuntimeError):
 
 class _WorkbookReadError(RuntimeError):
     """Raised when a spreadsheet cannot be opened; surfaced as unsupportedReason."""
+
+
+class _WorkbookRead(NamedTuple):
+    sheets: list[WorkbookSheetInfo]
+    definedNameCount: int | None
+    definedNamesSkipped: int | None
+    definedNames: list[WorkbookDefinedNameInfo]
+    ranges: list[AttachmentRangeData]
+    truncated: bool
 
 
 MESSAGE_SUMMARY_SELECT = (
@@ -233,6 +243,10 @@ DEFAULT_WORKBOOK_MAX_CELLS = 20_000
 # size before openpyxl starts parsing them.
 WORKBOOK_MAX_UNCOMPRESSED_BYTES = 250_000_000
 MAX_WORKBOOK_DEFINED_NAMES = 500
+WORKBOOK_ERROR_VALUE = re.compile(r"#(?:N/A|REF!|NAME\?|VALUE!|DIV/0!|NULL!|NUM!)")
+# A bracketed workbook before a sheet reference ([1]Proforma!C4); structured
+# table references like Table1[Rent] have no "!" and are kept.
+WORKBOOK_EXTERNAL_REFERENCE = re.compile(r"\[[^\]]+\][^!\[]*!")
 SAFE_ATTACHMENT_EXTENSIONS = {
     ".csv",
     ".ics",
@@ -1094,6 +1108,7 @@ class MicrosoftGraphClient:
         includeFormulas: bool = False,
         includeNumberFormat: bool = False,
         includeLayout: bool | None = None,
+        includeDefinedNames: bool = False,
         maxCells: int = DEFAULT_WORKBOOK_MAX_CELLS,
         maxBytes: int = DEFAULT_WORKBOOK_MAX_BYTES,
     ) -> MailAttachmentWorkbookResult:
@@ -1104,7 +1119,9 @@ class MicrosoftGraphClient:
         and defined names are returned, which is the cheap way to learn the
         layout before pulling cells. Once cells are requested the layout is
         left out, since a large model's sheet and name lists can dwarf a small
-        read; ``includeLayout`` overrides that either way.
+        read; ``includeLayout`` overrides that either way. The layout counts
+        defined names but lists them only with ``includeDefinedNames``, and
+        the list leaves out template leftovers (see ``_is_useful_defined_name``).
         """
 
         normalized_mailbox = self._normalize_mailbox(mailbox)
@@ -1147,7 +1164,7 @@ class MicrosoftGraphClient:
             return unsupported(f"Workbook size exceeds maxBytes={maxBytes}")
 
         try:
-            sheets, defined_names, range_data, truncated = self._read_workbook(
+            read = self._read_workbook(
                 content_bytes,
                 ranges=ranges,
                 sheet=sheet,
@@ -1156,6 +1173,7 @@ class MicrosoftGraphClient:
                 includeLayout=(
                     includeLayout if includeLayout is not None else not (ranges or sheet)
                 ),
+                includeDefinedNames=includeDefinedNames,
                 maxCells=maxCells,
             )
         except _WorkbookReadError as error:
@@ -1165,10 +1183,12 @@ class MicrosoftGraphClient:
             mailbox=normalized_mailbox or "me",
             messageId=messageId,
             attachment=attachment,
-            sheets=sheets,
-            definedNames=defined_names,
-            ranges=range_data,
-            truncated=truncated,
+            sheets=read.sheets,
+            definedNameCount=read.definedNameCount,
+            definedNamesSkipped=read.definedNamesSkipped,
+            definedNames=read.definedNames,
+            ranges=read.ranges,
+            truncated=read.truncated,
         )
 
     async def get_inline_images(
@@ -2606,13 +2626,9 @@ class MicrosoftGraphClient:
         includeFormulas: bool,
         includeNumberFormat: bool,
         includeLayout: bool,
+        includeDefinedNames: bool,
         maxCells: int,
-    ) -> tuple[
-        list[WorkbookSheetInfo],
-        list[WorkbookDefinedNameInfo],
-        list[AttachmentRangeData],
-        bool,
-    ]:
+    ) -> _WorkbookRead:
         self._check_workbook_archive(content_bytes)
         with warnings.catch_warnings():
             # openpyxl warns about every Excel feature it does not model
@@ -2632,6 +2648,7 @@ class MicrosoftGraphClient:
                     sheet=sheet,
                     includeNumberFormat=includeNumberFormat,
                     includeLayout=includeLayout,
+                    includeDefinedNames=includeDefinedNames,
                     maxCells=maxCells,
                 )
             except _WorkbookReadError:
@@ -2654,13 +2671,9 @@ class MicrosoftGraphClient:
         sheet: str | None,
         includeNumberFormat: bool,
         includeLayout: bool,
+        includeDefinedNames: bool,
         maxCells: int,
-    ) -> tuple[
-        list[WorkbookSheetInfo],
-        list[WorkbookDefinedNameInfo],
-        list[AttachmentRangeData],
-        bool,
-    ]:
+    ) -> _WorkbookRead:
         # The <dimension> a writer records can be stale or swollen by
         # formatting, so the used range is measured from the non-empty cells.
         # Measuring scans the whole sheet, so it only happens for sheets the
@@ -2674,7 +2687,15 @@ class MicrosoftGraphClient:
 
         sheets: list[WorkbookSheetInfo] = []
         defined_names: list[WorkbookDefinedNameInfo] = []
+        name_count: int | None = None
+        names_skipped: int | None = None
         truncated = False
+        if includeLayout or includeDefinedNames:
+            usable_names, names_skipped = self._workbook_defined_names(values_book)
+            name_count = len(usable_names)
+            if includeDefinedNames:
+                truncated = name_count > MAX_WORKBOOK_DEFINED_NAMES
+                defined_names = usable_names[:MAX_WORKBOOK_DEFINED_NAMES]
         if includeLayout:
             for worksheet in values_book.worksheets:
                 extent = extent_of(worksheet.title)
@@ -2687,7 +2708,6 @@ class MicrosoftGraphClient:
                         columnCount=extent[2] - extent[0] + 1 if extent else 0,
                     )
                 )
-            defined_names, truncated = self._workbook_defined_names(values_book)
 
         requests: list[str | None] = list(ranges or [])
         if not requests and sheet:
@@ -2793,7 +2813,14 @@ class MicrosoftGraphClient:
                 )
             )
 
-        return sheets, defined_names, range_data, truncated
+        return _WorkbookRead(
+            sheets=sheets,
+            definedNameCount=name_count,
+            definedNamesSkipped=names_skipped,
+            definedNames=defined_names,
+            ranges=range_data,
+            truncated=truncated,
+        )
 
     def _check_workbook_archive(self, content_bytes: bytes) -> None:
         try:
@@ -2845,20 +2872,22 @@ class MicrosoftGraphClient:
 
     def _workbook_defined_names(
         self, book: Any
-    ) -> tuple[list[WorkbookDefinedNameInfo], bool]:
+    ) -> tuple[list[WorkbookDefinedNameInfo], int]:
+        """Return the usable defined names and how many leftovers were skipped."""
+
         names: list[WorkbookDefinedNameInfo] = []
+        skipped = 0
 
         def collect(defined_names: Any, scope: str | None) -> None:
+            nonlocal skipped
             for defined_name in defined_names.values():
-                value = defined_name.value or ""
-                # Built-ins (print areas, filters) and names whose target was
-                # deleted are noise when looking for a model's inputs.
-                if defined_name.is_reserved or "#REF!" in value:
+                if not self._is_useful_defined_name(defined_name):
+                    skipped += 1
                     continue
                 names.append(
                     WorkbookDefinedNameInfo(
                         name=defined_name.name,
-                        value=value,
+                        value=defined_name.value or "",
                         scope=scope,
                     )
                 )
@@ -2866,8 +2895,26 @@ class MicrosoftGraphClient:
         collect(book.defined_names, None)
         for worksheet in book.worksheets:
             collect(worksheet.defined_names, worksheet.title)
-        truncated = len(names) > MAX_WORKBOOK_DEFINED_NAMES
-        return names[:MAX_WORKBOOK_DEFINED_NAMES], truncated
+        return names, skipped
+
+    @staticmethod
+    def _is_useful_defined_name(defined_name: Any) -> bool:
+        """Sponsor models picked up from broker templates carry hundreds of
+        names that are noise when looking for a model's inputs: built-ins
+        (print areas, filters), hidden names, underscore-prefixed print-macro
+        leftovers, array constants, names whose target is an error (#N/A,
+        deleted cells), and links into other workbooks this tool cannot read.
+        They still resolve when requested by name; they are only unlisted."""
+
+        name = defined_name.name or ""
+        value = (defined_name.value or "").strip()
+        if defined_name.is_reserved or getattr(defined_name, "hidden", False):
+            return False
+        if not value or name.startswith("_"):
+            return False
+        if value.startswith("{") or WORKBOOK_ERROR_VALUE.search(value):
+            return False
+        return not WORKBOOK_EXTERNAL_REFERENCE.search(value)
 
     def _resolve_workbook_range(
         self,

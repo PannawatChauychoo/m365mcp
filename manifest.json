@@ -220,7 +220,7 @@
     },
     {
       "name": "mail_get_attachment_workbook",
-      "description": "Read cells from an Excel (.xlsx/.xlsm) attachment without saving it. Call with no ranges or sheet first to get the sheet list, used ranges, and defined names; then pull only the cells needed with\u2026"
+      "description": "Read cells from an Excel (.xlsx/.xlsm) attachment without saving it. Call with no ranges or sheet first to get the sheet list, used ranges, and a count of defined names (includeDefinedNames=true\u2026"
     },
     {
       "name": "mail_get_thread",

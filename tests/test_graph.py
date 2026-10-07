@@ -1704,11 +1704,19 @@ async def test_workbook_attachment_outline_lists_sheets_and_names() -> None:
     ]
     assert result.sheets[0].rowCount == 5
     assert result.sheets[0].columnCount == 2
-    # Names pointing at deleted cells are dropped.
-    assert {(name.name, name.value) for name in result.definedNames} == {
+    # The outline counts names but lists none; Broken points at deleted cells.
+    assert result.definedNames == []
+    assert result.definedNameCount == 2
+    assert result.definedNamesSkipped == 1
+
+    named = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", includeDefinedNames=True
+    )
+    assert {(name.name, name.value) for name in named.definedNames} == {
         ("PurchasePrice", "Assumptions!$B$1"),
         ("IRR", "'Unit Mix'!$C$3"),
     }
+    assert len(named.sheets) == 3
 
     await client.aclose()
 
@@ -1845,11 +1853,77 @@ async def test_workbook_attachment_range_reads_skip_layout_unless_asked() -> Non
         includeLayout=True,
     )
     assert len(with_layout.sheets) == 41
-    assert len(with_layout.definedNames) == 40
+    assert with_layout.definedNameCount == 40
+    assert with_layout.definedNames == []
 
     # The discovery call (no ranges, no sheet) still returns the layout.
     layout = await graph.get_attachment_workbook(messageId="msg-1", attachmentId="xl-1")
     assert len(layout.sheets) == 41 and layout.ranges == []
+
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_workbook_attachment_names_drop_template_leftovers() -> None:
+    def build(workbook) -> None:
+        from openpyxl.workbook.defined_name import DefinedName
+
+        sheet = workbook.active
+        sheet.title = "Assump"
+        sheet["B2"] = 25_000_000
+        sheet["B3"] = 0.055
+        names = workbook.defined_names
+        names["PurchasePrice"] = DefinedName("PurchasePrice", attr_text="Assump!$B$2")
+        names["ExitCap"] = DefinedName("ExitCap", attr_text="Assump!$B$3")
+        names["TaxRate"] = DefinedName("TaxRate", attr_text="0.012")
+        # Leftovers broker templates carry by the hundred.
+        for index in range(300):
+            junk = "_" * 41 + f"a{index}"
+            names[junk] = DefinedName(
+                junk, attr_text='{"Assump",#N/A,TRUE,"Proforma";"Assump",#N/A,TRUE,"Proforma"}'
+            )
+        for index in range(150):
+            names[f"OldInput{index}"] = DefinedName(f"OldInput{index}", attr_text="#N/A")
+        names["Deleted"] = DefinedName("Deleted", attr_text="Assump!#REF!")
+        names["Linked"] = DefinedName("Linked", attr_text="[1]Proforma!$C$4")
+        names["RentColumn"] = DefinedName("RentColumn", attr_text="Rents[Rent]")
+        names["Hidden"] = DefinedName("Hidden", attr_text="Assump!$B$2", hidden=True)
+        names["wrn.Print_All."] = DefinedName(
+            "wrn.Print_All.", attr_text='{#N/A,#N/A,FALSE,"Proforma"}'
+        )
+        sheet.print_area = "A1:B3"
+
+    client, graph = _workbook_graph(_xlsx_bytes(build))
+
+    outline = await graph.get_attachment_workbook(messageId="msg-1", attachmentId="xl-1")
+    assert outline.definedNames == []
+    assert outline.definedNameCount == 4
+    # 300 + 150 leftovers plus Deleted, Linked, Hidden, and wrn.Print_All.;
+    # openpyxl lifts the print area onto the sheet, so it is never a name.
+    assert outline.definedNamesSkipped == 454
+    assert len(outline.model_dump_json()) < 1500
+
+    named = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", includeDefinedNames=True
+    )
+    assert [name.name for name in named.definedNames] == [
+        "PurchasePrice",
+        "ExitCap",
+        "TaxRate",
+        "RentColumn",
+    ]
+    assert len(named.model_dump_json()) < 2000
+
+    # A name left off the list still resolves when asked for directly.
+    with_cells = await graph.get_attachment_workbook(
+        messageId="msg-1",
+        attachmentId="xl-1",
+        ranges=["Hidden", "PurchasePrice"],
+        includeDefinedNames=True,
+    )
+    assert [r.values for r in with_cells.ranges] == [[[25_000_000]], [[25_000_000]]]
+    assert len(with_cells.definedNames) == 4
+    assert with_cells.sheets == []
 
     await client.aclose()
 

@@ -326,6 +326,10 @@ class MailAttachmentWorkbookResult(AppModel):
     messageId: str
     attachment: AttachmentInfo
     sheets: list[WorkbookSheetInfo] = Field(default_factory=list)
+    # Usable names and template leftovers (#N/A, #REF!, print macros, ...)
+    # are counted with the layout; the names themselves are opt-in.
+    definedNameCount: int | None = None
+    definedNamesSkipped: int | None = None
     definedNames: list[WorkbookDefinedNameInfo] = Field(default_factory=list)
     ranges: list[AttachmentRangeData] = Field(default_factory=list)
     truncated: bool = False

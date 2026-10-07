@@ -1785,6 +1785,7 @@ async def test_workbook_attachment_sheet_mode_and_stale_dimension() -> None:
         messageId="msg-1",
         attachmentId="xl-1",
         sheet="Rent Roll",
+        includeLayout=True,
     )
 
     assert result.sheets[0].dimensions == "A1:C5"
@@ -1801,6 +1802,54 @@ async def test_workbook_attachment_sheet_mode_and_stale_dimension() -> None:
     )
     # One sheet, so an unqualified address needs no sheet name.
     assert single.ranges[0].values == [[2000], [3000]]
+
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_workbook_attachment_range_reads_skip_layout_unless_asked() -> None:
+    def build(workbook) -> None:
+        from openpyxl.workbook.defined_name import DefinedName
+
+        first = workbook.active
+        first.title = "Summary"
+        first["A1"] = "Price"
+        first["B1"] = 1000
+        for index in range(40):
+            extra = workbook.create_sheet(f"Tab {index}")
+            extra["A1"] = index
+            workbook.defined_names[f"Input{index}"] = DefinedName(
+                f"Input{index}", attr_text=f"'Tab {index}'!$A$1"
+            )
+
+    client, graph = _workbook_graph(_xlsx_bytes(build))
+
+    narrow = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", ranges=["Summary!A1:B1"]
+    )
+    assert narrow.ranges[0].values == [["Price", 1000]]
+    assert narrow.sheets == []
+    assert narrow.definedNames == []
+    assert len(narrow.model_dump_json()) < 1500
+
+    by_sheet = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", sheet="Summary"
+    )
+    assert by_sheet.ranges[0].values == [["Price", 1000]]
+    assert by_sheet.sheets == [] and by_sheet.definedNames == []
+
+    with_layout = await graph.get_attachment_workbook(
+        messageId="msg-1",
+        attachmentId="xl-1",
+        ranges=["Summary!A1:B1"],
+        includeLayout=True,
+    )
+    assert len(with_layout.sheets) == 41
+    assert len(with_layout.definedNames) == 40
+
+    # The discovery call (no ranges, no sheet) still returns the layout.
+    layout = await graph.get_attachment_workbook(messageId="msg-1", attachmentId="xl-1")
+    assert len(layout.sheets) == 41 and layout.ranges == []
 
     await client.aclose()
 

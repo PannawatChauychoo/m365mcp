@@ -1008,7 +1008,8 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
             "Read cells from an Excel (.xlsx/.xlsm) attachment without saving "
             "it. Call with no ranges or sheet first to get the sheet list, used "
             "ranges, and defined names; then pull only the cells needed with "
-            "ranges like [\"'Unit Mix'!A1:H40\", \"PurchasePrice\"]. Values are "
+            "ranges like [\"'Unit Mix'!A1:H40\", \"PurchasePrice\"]. Cell reads "
+            "leave the sheet list and names out unless includeLayout=true. Values are "
             "what Excel saved with the file — nothing is "
             "recalculated, so a formula never calculated in Excel reads as "
             "null. One call returns at most maxCells cells; truncated: true "
@@ -1023,6 +1024,7 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
         sheet: str | None = None,
         includeFormulas: bool = False,
         includeNumberFormat: bool = False,
+        includeLayout: bool | None = None,
         maxCells: int = DEFAULT_WORKBOOK_MAX_CELLS,
         maxBytes: int = DEFAULT_WORKBOOK_MAX_BYTES,
     ) -> MailAttachmentWorkbookResult:
@@ -1035,6 +1037,7 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
             sheet=sheet,
             includeFormulas=includeFormulas,
             includeNumberFormat=includeNumberFormat,
+            includeLayout=includeLayout,
             maxCells=maxCells,
             maxBytes=maxBytes,
         )

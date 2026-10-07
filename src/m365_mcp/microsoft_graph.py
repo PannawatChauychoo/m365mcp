@@ -6,7 +6,7 @@ import warnings
 import zipfile
 from contextlib import asynccontextmanager
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import quote
 
 import httpx
@@ -1093,6 +1093,7 @@ class MicrosoftGraphClient:
         sheet: str | None = None,
         includeFormulas: bool = False,
         includeNumberFormat: bool = False,
+        includeLayout: bool | None = None,
         maxCells: int = DEFAULT_WORKBOOK_MAX_CELLS,
         maxBytes: int = DEFAULT_WORKBOOK_MAX_BYTES,
     ) -> MailAttachmentWorkbookResult:
@@ -1101,7 +1102,9 @@ class MicrosoftGraphClient:
         Values are the results Excel cached at the last save; nothing is
         recalculated. With neither ``ranges`` nor ``sheet`` only the sheet list
         and defined names are returned, which is the cheap way to learn the
-        layout before pulling cells.
+        layout before pulling cells. Once cells are requested the layout is
+        left out, since a large model's sheet and name lists can dwarf a small
+        read; ``includeLayout`` overrides that either way.
         """
 
         normalized_mailbox = self._normalize_mailbox(mailbox)
@@ -1150,6 +1153,9 @@ class MicrosoftGraphClient:
                 sheet=sheet,
                 includeFormulas=includeFormulas,
                 includeNumberFormat=includeNumberFormat,
+                includeLayout=(
+                    includeLayout if includeLayout is not None else not (ranges or sheet)
+                ),
                 maxCells=maxCells,
             )
         except _WorkbookReadError as error:
@@ -2599,6 +2605,7 @@ class MicrosoftGraphClient:
         sheet: str | None,
         includeFormulas: bool,
         includeNumberFormat: bool,
+        includeLayout: bool,
         maxCells: int,
     ) -> tuple[
         list[WorkbookSheetInfo],
@@ -2624,6 +2631,7 @@ class MicrosoftGraphClient:
                     ranges=ranges,
                     sheet=sheet,
                     includeNumberFormat=includeNumberFormat,
+                    includeLayout=includeLayout,
                     maxCells=maxCells,
                 )
             except _WorkbookReadError:
@@ -2645,6 +2653,7 @@ class MicrosoftGraphClient:
         ranges: list[str] | None,
         sheet: str | None,
         includeNumberFormat: bool,
+        includeLayout: bool,
         maxCells: int,
     ) -> tuple[
         list[WorkbookSheetInfo],
@@ -2654,33 +2663,31 @@ class MicrosoftGraphClient:
     ]:
         # The <dimension> a writer records can be stale or swollen by
         # formatting, so the used range is measured from the non-empty cells.
-        extents = {
-            worksheet.title: self._worksheet_extent(worksheet)
-            for worksheet in values_book.worksheets
-        }
-        sheets = [
-            WorkbookSheetInfo(
-                name=worksheet.title,
-                visibility=worksheet.sheet_state or "visible",
-                dimensions=(
-                    self._a1_address(*extents[worksheet.title])
-                    if extents[worksheet.title]
-                    else None
-                ),
-                rowCount=(
-                    extents[worksheet.title][3] - extents[worksheet.title][1] + 1
-                    if extents[worksheet.title]
-                    else 0
-                ),
-                columnCount=(
-                    extents[worksheet.title][2] - extents[worksheet.title][0] + 1
-                    if extents[worksheet.title]
-                    else 0
-                ),
-            )
-            for worksheet in values_book.worksheets
-        ]
-        defined_names, truncated = self._workbook_defined_names(values_book)
+        # Measuring scans the whole sheet, so it only happens for sheets the
+        # layout or a whole-row/column request actually needs.
+        extents: dict[str, tuple[int, int, int, int] | None] = {}
+
+        def extent_of(title: str) -> tuple[int, int, int, int] | None:
+            if title not in extents:
+                extents[title] = self._worksheet_extent(values_book[title])
+            return extents[title]
+
+        sheets: list[WorkbookSheetInfo] = []
+        defined_names: list[WorkbookDefinedNameInfo] = []
+        truncated = False
+        if includeLayout:
+            for worksheet in values_book.worksheets:
+                extent = extent_of(worksheet.title)
+                sheets.append(
+                    WorkbookSheetInfo(
+                        name=worksheet.title,
+                        visibility=worksheet.sheet_state or "visible",
+                        dimensions=self._a1_address(*extent) if extent else None,
+                        rowCount=extent[3] - extent[1] + 1 if extent else 0,
+                        columnCount=extent[2] - extent[0] + 1 if extent else 0,
+                    )
+                )
+            defined_names, truncated = self._workbook_defined_names(values_book)
 
         requests: list[str | None] = list(ranges or [])
         if not requests and sheet:
@@ -2695,7 +2702,7 @@ class MicrosoftGraphClient:
                     values_book,
                     request,
                     default_sheet=sheet,
-                    extents=extents,
+                    extent_of=extent_of,
                 )
             except _WorkbookReadError as error:
                 range_data.append(
@@ -2868,7 +2875,7 @@ class MicrosoftGraphClient:
         request: str | None,
         *,
         default_sheet: str | None,
-        extents: dict[str, tuple[int, int, int, int] | None],
+        extent_of: Callable[[str], tuple[int, int, int, int] | None],
     ) -> tuple[str, tuple[int, int, int, int] | None]:
         """Turn an A1 address, ``Sheet!A1:B2``, or a defined name into a sheet
         and ``(min_col, min_row, max_col, max_row)`` bounds. Whole rows or
@@ -2891,9 +2898,8 @@ class MicrosoftGraphClient:
                 )
 
         worksheet_name = self._match_worksheet(book, sheet_name or default_sheet)
-        extent = extents[worksheet_name]
         if not address:
-            return worksheet_name, extent
+            return worksheet_name, extent_of(worksheet_name)
 
         try:
             min_col, min_row, max_col, max_row = range_boundaries(address)
@@ -2902,6 +2908,7 @@ class MicrosoftGraphClient:
                 f"'{request}' is not an A1 address or defined name"
             ) from error
         if None in (min_col, min_row, max_col, max_row):
+            extent = extent_of(worksheet_name)
             if extent is None:
                 return worksheet_name, None
             min_col = min_col or extent[0]

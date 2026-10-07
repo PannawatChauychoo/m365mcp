@@ -1608,7 +1608,13 @@ def _xlsx_bytes(
             if info.filename == "xl/worksheets/sheet1.xml":
                 xml = data.decode("utf-8")
                 for formula, value in (cached or {}).items():
-                    xml = xml.replace(f"<f>{formula}</f><v />", f"<f>{formula}</f><v>{value}</v>")
+                    # openpyxl writes the empty cached value as <v /> or, when
+                    # lxml is installed, as <v></v>.
+                    xml = re.sub(
+                        rf"<f>{re.escape(formula)}</f><v(?: />|></v>)",
+                        f"<f>{formula}</f><v>{value}</v>",
+                        xml,
+                    )
                 if dimension is not None:
                     xml = re.sub(r'<dimension ref="[^"]*" />', f'<dimension ref="{dimension}" />', xml)
                 data = xml.encode("utf-8")

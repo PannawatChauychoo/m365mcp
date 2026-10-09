@@ -1,15 +1,14 @@
 from __future__ import annotations
 
 import base64
+import functools
 import io
-import re
-import warnings
-import zipfile
 from contextlib import asynccontextmanager
-from datetime import date, datetime, time, timedelta, timezone
-from typing import Any, Callable, NamedTuple
+from datetime import datetime, timedelta, timezone
+from typing import Any
 from urllib.parse import quote
 
+import anyio
 import httpx
 
 try:  # pragma: no cover - exercised through dependency-aware tests
@@ -27,16 +26,9 @@ try:  # pragma: no cover
 except Exception:  # pragma: no cover
     PILImage = None  # type: ignore[assignment]
 
-try:  # pragma: no cover - spreadsheet reading degrades to a reason string
-    import openpyxl
-    from openpyxl.utils.cell import get_column_letter, range_boundaries
-except Exception:  # pragma: no cover
-    openpyxl = None  # type: ignore[assignment]
-
 from .models import (
     AttachmentImage,
     AttachmentInfo,
-    AttachmentRangeData,
     CalendarAttendee,
     CalendarCreateEventResult,
     CalendarDateTime,
@@ -87,10 +79,14 @@ from .models import (
     MessageSummary,
     PdfPageImage,
     SkippedAttachment,
-    WorkbookDefinedNameInfo,
-    WorkbookSheetInfo,
 )
 from .microsoft_auth import MicrosoftAuthService
+from . import workbook_reader
+from .workbook_reader import (
+    DEFAULT_WORKBOOK_MAX_BYTES,
+    DEFAULT_WORKBOOK_MAX_CELLS,
+    WorkbookReadError,
+)
 
 
 def _utc_now_iso() -> str:
@@ -99,19 +95,6 @@ def _utc_now_iso() -> str:
 
 class _PdfRenderError(RuntimeError):
     """Raised when a PDF cannot be rasterized; surfaced as unsupportedReason."""
-
-
-class _WorkbookReadError(RuntimeError):
-    """Raised when a spreadsheet cannot be opened; surfaced as unsupportedReason."""
-
-
-class _WorkbookRead(NamedTuple):
-    sheets: list[WorkbookSheetInfo]
-    definedNameCount: int | None
-    definedNamesSkipped: int | None
-    definedNames: list[WorkbookDefinedNameInfo]
-    ranges: list[AttachmentRangeData]
-    truncated: bool
 
 
 MESSAGE_SUMMARY_SELECT = (
@@ -221,32 +204,8 @@ DEFAULT_MAX_PDF_PAGES = 5
 # Source PDFs are downloaded, not viewed, so this is far larger than an image
 # cap; the page images it renders to are bounded separately.
 DEFAULT_PDF_MAX_BYTES = 25_000_000
-# Spreadsheets are parsed locally with openpyxl, so only the OOXML formats it
-# reads are accepted; legacy .xls and binary .xlsb get a reason instead.
-SPREADSHEET_CONTENT_TYPES = {
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.template",
-    "application/vnd.ms-excel.sheet.macroenabled.12",
-    "application/vnd.ms-excel.template.macroenabled.12",
-}
-SPREADSHEET_EXTENSIONS = (".xlsx", ".xlsm", ".xltx", ".xltm")
-LEGACY_SPREADSHEET_CONTENT_TYPES = {
-    "application/vnd.ms-excel",
-    "application/vnd.ms-excel.sheet.binary.macroenabled.12",
-}
-LEGACY_SPREADSHEET_EXTENSIONS = (".xls", ".xlsb", ".xlt")
-DEFAULT_WORKBOOK_MAX_BYTES = 10_000_000
-# Cell values land in the model's context, so one call is bounded well below
-# what a sheet can hold; page through a large sheet by range instead.
-DEFAULT_WORKBOOK_MAX_CELLS = 20_000
-# An .xlsx is a zip; refuse archives that inflate far beyond their download
-# size before openpyxl starts parsing them.
-WORKBOOK_MAX_UNCOMPRESSED_BYTES = 250_000_000
-MAX_WORKBOOK_DEFINED_NAMES = 500
-WORKBOOK_ERROR_VALUE = re.compile(r"#(?:N/A|REF!|NAME\?|VALUE!|DIV/0!|NULL!|NUM!)")
-# A bracketed workbook before a sheet reference ([1]Proforma!C4); structured
-# table references like Table1[Rent] have no "!" and are kept.
-WORKBOOK_EXTERNAL_REFERENCE = re.compile(r"\[[^\]]+\][^!\[]*!")
+# Metadata only: contentBytes is left out so the download can be size-checked.
+WORKBOOK_ATTACHMENT_SELECT = "id,name,contentType,size,isInline,lastModifiedDateTime"
 SAFE_ATTACHMENT_EXTENSIONS = {
     ".csv",
     ".ics",
@@ -1121,13 +1080,23 @@ class MicrosoftGraphClient:
         left out, since a large model's sheet and name lists can dwarf a small
         read; ``includeLayout`` overrides that either way. The layout counts
         defined names but lists them only with ``includeDefinedNames``, and
-        the list leaves out template leftovers (see ``_is_useful_defined_name``).
+        the list leaves out template leftovers (see
+        ``workbook_reader._is_useful_defined_name``). ``maxBytes`` and ``maxCells``
+        are clamped to the module ceilings.
         """
 
         normalized_mailbox = self._normalize_mailbox(mailbox)
         base = self._base_path(normalized_mailbox)
+        maxBytes = workbook_reader.clamp_max_bytes(maxBytes)
+        maxCells = workbook_reader.clamp_max_cells(maxCells)
+        attachment_path = (
+            f"{base}/messages/{quote(messageId, safe='')}"
+            f"/attachments/{quote(attachmentId, safe='')}"
+        )
+        # Without $select Graph inlines the whole file as contentBytes, so the
+        # size could only be checked after the download it is meant to bound.
         metadata = await self._request(
-            f"{base}/messages/{quote(messageId, safe='')}/attachments/{quote(attachmentId, safe='')}"
+            f"{attachment_path}?$select={WORKBOOK_ATTACHMENT_SELECT}"
         )
         attachment = self._map_attachment(metadata)
 
@@ -1150,33 +1119,38 @@ class MicrosoftGraphClient:
             )
         if not self._is_spreadsheet_attachment(attachment):
             return unsupported("Attachment is not an .xlsx or .xlsm workbook")
-        if openpyxl is None:
-            return unsupported("Workbook reading requires the openpyxl package")
+        reason = workbook_reader.unavailable_reason()
+        if reason is not None:
+            return unsupported(reason)
         if attachment.size is not None and attachment.size > maxBytes:
             return unsupported(f"Workbook size exceeds maxBytes={maxBytes}")
 
-        content_bytes = await self._attachment_bytes(
-            base,
-            messageId=messageId,
-            attachment=metadata,
+        content_bytes = await self._request_bytes_limited(
+            f"{attachment_path}/$value", maxBytes=maxBytes
         )
-        if len(content_bytes) > maxBytes:
+        if content_bytes is None:
             return unsupported(f"Workbook size exceeds maxBytes={maxBytes}")
 
         try:
-            read = self._read_workbook(
-                content_bytes,
-                ranges=ranges,
-                sheet=sheet,
-                includeFormulas=includeFormulas,
-                includeNumberFormat=includeNumberFormat,
-                includeLayout=(
-                    includeLayout if includeLayout is not None else not (ranges or sheet)
-                ),
-                includeDefinedNames=includeDefinedNames,
-                maxCells=maxCells,
+            # Parsing is CPU-bound; keep it off the event loop.
+            read = await anyio.to_thread.run_sync(
+                functools.partial(
+                    workbook_reader.read_workbook,
+                    content_bytes,
+                    ranges=ranges,
+                    sheet=sheet,
+                    includeFormulas=includeFormulas,
+                    includeNumberFormat=includeNumberFormat,
+                    includeLayout=(
+                        includeLayout
+                        if includeLayout is not None
+                        else not (ranges or sheet)
+                    ),
+                    includeDefinedNames=includeDefinedNames,
+                    maxCells=maxCells,
+                )
             )
-        except _WorkbookReadError as error:
+        except WorkbookReadError as error:
             return unsupported(str(error))
 
         return MailAttachmentWorkbookResult(
@@ -2246,31 +2220,66 @@ class MicrosoftGraphClient:
             response = await client.request(
                 "GET",
                 f"https://graph.microsoft.com/v1.0{path}",
-                headers={
-                    "Accept": "*/*",
-                    "Authorization": f"Bearer {access_token}",
-                    "Prefer": 'IdType="ImmutableId"',
-                },
+                headers=self._bytes_headers(access_token),
             )
 
         if not response.is_success:
-            detail = response.reason_phrase
-            if response.text:
-                try:
-                    data = response.json()
-                    if isinstance(data, dict):
-                        detail = (
-                            data.get("error", {}).get("message")
-                            or data.get("error_description")
-                            or detail
-                        )
-                except Exception:
-                    detail = response.text
-            raise RuntimeError(
-                f"Microsoft Graph request failed ({response.status_code}): {detail}"
-            )
+            raise self._bytes_request_error(response)
 
         return response.content
+
+    async def _request_bytes_limited(self, path: str, *, maxBytes: int) -> bytes | None:
+        """Stream a download, giving up once more than ``maxBytes`` arrive.
+
+        Returns ``None`` when the payload is too large, so an attachment whose
+        reported size was wrong still never fills memory.
+        """
+
+        access_token = await self._auth_service.get_access_token()
+        async with self._client() as client:
+            async with client.stream(
+                "GET",
+                f"https://graph.microsoft.com/v1.0{path}",
+                headers=self._bytes_headers(access_token),
+            ) as response:
+                if not response.is_success:
+                    await response.aread()
+                    raise self._bytes_request_error(response)
+                content_length = response.headers.get("Content-Length")
+                if content_length and content_length.isdigit() and int(content_length) > maxBytes:
+                    return None
+                buffer = bytearray()
+                async for chunk in response.aiter_bytes():
+                    buffer += chunk
+                    if len(buffer) > maxBytes:
+                        return None
+        return bytes(buffer)
+
+    @staticmethod
+    def _bytes_headers(access_token: str) -> dict[str, str]:
+        return {
+            "Accept": "*/*",
+            "Authorization": f"Bearer {access_token}",
+            "Prefer": 'IdType="ImmutableId"',
+        }
+
+    @staticmethod
+    def _bytes_request_error(response: httpx.Response) -> RuntimeError:
+        detail = response.reason_phrase
+        if response.text:
+            try:
+                data = response.json()
+                if isinstance(data, dict):
+                    detail = (
+                        data.get("error", {}).get("message")
+                        or data.get("error_description")
+                        or detail
+                    )
+            except Exception:
+                detail = response.text
+        return RuntimeError(
+            f"Microsoft Graph request failed ({response.status_code}): {detail}"
+        )
 
     def _to_recipients(self, addresses: list[str] | None) -> list[dict[str, Any]] | None:
         cleaned = [address for address in (addresses or []) if address]
@@ -2602,449 +2611,12 @@ class MicrosoftGraphClient:
         return content_type == "application/pdf" or name.endswith(".pdf")
 
     def _is_spreadsheet_attachment(self, attachment: AttachmentInfo) -> bool:
-        content_type = (attachment.contentType or "").split(";")[0].strip().lower()
-        name = (attachment.name or "").lower()
-        return content_type in SPREADSHEET_CONTENT_TYPES or name.endswith(
-            SPREADSHEET_EXTENSIONS
-        )
+        return workbook_reader.is_spreadsheet(attachment.name, attachment.contentType)
 
     def _is_legacy_spreadsheet_attachment(self, attachment: AttachmentInfo) -> bool:
-        content_type = (attachment.contentType or "").split(";")[0].strip().lower()
-        name = (attachment.name or "").lower()
-        if name.endswith(SPREADSHEET_EXTENSIONS):
-            return False
-        return content_type in LEGACY_SPREADSHEET_CONTENT_TYPES or name.endswith(
-            LEGACY_SPREADSHEET_EXTENSIONS
+        return workbook_reader.is_legacy_spreadsheet(
+            attachment.name, attachment.contentType
         )
-
-    def _read_workbook(
-        self,
-        content_bytes: bytes,
-        *,
-        ranges: list[str] | None,
-        sheet: str | None,
-        includeFormulas: bool,
-        includeNumberFormat: bool,
-        includeLayout: bool,
-        includeDefinedNames: bool,
-        maxCells: int,
-    ) -> _WorkbookRead:
-        self._check_workbook_archive(content_bytes)
-        with warnings.catch_warnings():
-            # openpyxl warns about every Excel feature it does not model
-            # (data validation extensions, slicers, ...); none affect values.
-            warnings.simplefilter("ignore")
-            values_book = self._open_workbook(content_bytes, data_only=True)
-            formulas_book = None
-            try:
-                if includeFormulas and (ranges or sheet):
-                    formulas_book = self._open_workbook(
-                        content_bytes, data_only=False
-                    )
-                return self._read_open_workbook(
-                    values_book,
-                    formulas_book,
-                    ranges=ranges,
-                    sheet=sheet,
-                    includeNumberFormat=includeNumberFormat,
-                    includeLayout=includeLayout,
-                    includeDefinedNames=includeDefinedNames,
-                    maxCells=maxCells,
-                )
-            except _WorkbookReadError:
-                raise
-            except Exception as error:  # pragma: no cover - parser internals
-                raise _WorkbookReadError(
-                    f"Could not read workbook: {error}"
-                ) from error
-            finally:
-                values_book.close()
-                if formulas_book is not None:
-                    formulas_book.close()
-
-    def _read_open_workbook(
-        self,
-        values_book: Any,
-        formulas_book: Any | None,
-        *,
-        ranges: list[str] | None,
-        sheet: str | None,
-        includeNumberFormat: bool,
-        includeLayout: bool,
-        includeDefinedNames: bool,
-        maxCells: int,
-    ) -> _WorkbookRead:
-        # The <dimension> a writer records can be stale or swollen by
-        # formatting, so the used range is measured from the non-empty cells.
-        # Measuring scans the whole sheet, so it only happens for sheets the
-        # layout or a whole-row/column request actually needs.
-        extents: dict[str, tuple[int, int, int, int] | None] = {}
-
-        def extent_of(title: str) -> tuple[int, int, int, int] | None:
-            if title not in extents:
-                extents[title] = self._worksheet_extent(values_book[title])
-            return extents[title]
-
-        sheets: list[WorkbookSheetInfo] = []
-        defined_names: list[WorkbookDefinedNameInfo] = []
-        name_count: int | None = None
-        names_skipped: int | None = None
-        truncated = False
-        if includeLayout or includeDefinedNames:
-            usable_names, names_skipped = self._workbook_defined_names(values_book)
-            name_count = len(usable_names)
-            if includeDefinedNames:
-                truncated = name_count > MAX_WORKBOOK_DEFINED_NAMES
-                defined_names = usable_names[:MAX_WORKBOOK_DEFINED_NAMES]
-        if includeLayout:
-            for worksheet in values_book.worksheets:
-                extent = extent_of(worksheet.title)
-                sheets.append(
-                    WorkbookSheetInfo(
-                        name=worksheet.title,
-                        visibility=worksheet.sheet_state or "visible",
-                        dimensions=self._a1_address(*extent) if extent else None,
-                        rowCount=extent[3] - extent[1] + 1 if extent else 0,
-                        columnCount=extent[2] - extent[0] + 1 if extent else 0,
-                    )
-                )
-
-        requests: list[str | None] = list(ranges or [])
-        if not requests and sheet:
-            # A sheet without ranges means "its whole used range".
-            requests = [None]
-
-        range_data: list[AttachmentRangeData] = []
-        remaining = maxCells
-        for request in requests:
-            try:
-                worksheet_name, bounds = self._resolve_workbook_range(
-                    values_book,
-                    request,
-                    default_sheet=sheet,
-                    extent_of=extent_of,
-                )
-            except _WorkbookReadError as error:
-                range_data.append(
-                    AttachmentRangeData(
-                        worksheet=sheet or "",
-                        address=request or "",
-                        error=str(error),
-                    )
-                )
-                continue
-
-            if bounds is None:
-                range_data.append(
-                    AttachmentRangeData(
-                        worksheet=worksheet_name,
-                        address="",
-                        values=[],
-                        rowCount=0,
-                        columnCount=0,
-                    )
-                )
-                continue
-
-            min_col, min_row, max_col, max_row = bounds
-            column_count = max_col - min_col + 1
-            row_count = max_row - min_row + 1
-            range_truncated = False
-            if row_count * column_count > remaining:
-                allowed_rows = remaining // column_count
-                truncated = True
-                if allowed_rows == 0:
-                    range_data.append(
-                        AttachmentRangeData(
-                            worksheet=worksheet_name,
-                            address=self._a1_address(*bounds),
-                            truncated=True,
-                            error=(
-                                f"maxCells={maxCells} is used up; request this "
-                                "range in another call"
-                            ),
-                        )
-                    )
-                    continue
-                max_row = min_row + allowed_rows - 1
-                row_count = allowed_rows
-                range_truncated = True
-            remaining -= row_count * column_count
-
-            cells = list(
-                values_book[worksheet_name].iter_rows(
-                    min_row=min_row,
-                    max_row=max_row,
-                    min_col=min_col,
-                    max_col=max_col,
-                )
-            )
-            formulas = None
-            if formulas_book is not None:
-                formulas = [
-                    [self._workbook_cell_value(cell.value) for cell in row]
-                    for row in formulas_book[worksheet_name].iter_rows(
-                        min_row=min_row,
-                        max_row=max_row,
-                        min_col=min_col,
-                        max_col=max_col,
-                    )
-                ]
-            range_data.append(
-                AttachmentRangeData(
-                    worksheet=worksheet_name,
-                    address=self._a1_address(min_col, min_row, max_col, max_row),
-                    values=[
-                        [self._workbook_cell_value(cell.value) for cell in row]
-                        for row in cells
-                    ],
-                    formulas=formulas,
-                    numberFormat=(
-                        [
-                            [getattr(cell, "number_format", None) for cell in row]
-                            for row in cells
-                        ]
-                        if includeNumberFormat
-                        else None
-                    ),
-                    rowCount=row_count,
-                    columnCount=column_count,
-                    truncated=range_truncated,
-                )
-            )
-
-        return _WorkbookRead(
-            sheets=sheets,
-            definedNameCount=name_count,
-            definedNamesSkipped=names_skipped,
-            definedNames=defined_names,
-            ranges=range_data,
-            truncated=truncated,
-        )
-
-    def _check_workbook_archive(self, content_bytes: bytes) -> None:
-        try:
-            with zipfile.ZipFile(io.BytesIO(content_bytes)) as archive:
-                inflated = sum(info.file_size for info in archive.infolist())
-        except zipfile.BadZipFile as error:
-            raise _WorkbookReadError(
-                "Attachment is not a readable .xlsx workbook; it may be "
-                "password-protected or a legacy .xls file with an .xlsx name"
-            ) from error
-        if inflated > WORKBOOK_MAX_UNCOMPRESSED_BYTES:
-            raise _WorkbookReadError(
-                "Workbook expands to more than "
-                f"{WORKBOOK_MAX_UNCOMPRESSED_BYTES} bytes and was not opened"
-            )
-
-    def _open_workbook(self, content_bytes: bytes, *, data_only: bool) -> Any:
-        try:
-            return openpyxl.load_workbook(
-                io.BytesIO(content_bytes),
-                read_only=True,
-                data_only=data_only,
-                keep_links=False,
-            )
-        except Exception as error:
-            raise _WorkbookReadError(f"Could not open workbook: {error}") from error
-
-    def _worksheet_extent(self, worksheet: Any) -> tuple[int, int, int, int] | None:
-        """Return ``(min_col, min_row, max_col, max_row)`` of non-empty cells."""
-
-        worksheet.reset_dimensions()
-        min_col = min_row = max_col = max_row = None
-        for row_index, row in enumerate(
-            worksheet.iter_rows(min_row=1, values_only=True), start=1
-        ):
-            for column_index, value in enumerate(row, start=1):
-                if value is None or value == "":
-                    continue
-                if min_row is None:
-                    min_row = row_index
-                max_row = row_index
-                if min_col is None or column_index < min_col:
-                    min_col = column_index
-                if max_col is None or column_index > max_col:
-                    max_col = column_index
-        if min_row is None:
-            return None
-        return min_col, min_row, max_col, max_row
-
-    def _workbook_defined_names(
-        self, book: Any
-    ) -> tuple[list[WorkbookDefinedNameInfo], int]:
-        """Return the usable defined names and how many leftovers were skipped."""
-
-        names: list[WorkbookDefinedNameInfo] = []
-        skipped = 0
-
-        def collect(defined_names: Any, scope: str | None) -> None:
-            nonlocal skipped
-            for defined_name in defined_names.values():
-                if not self._is_useful_defined_name(defined_name):
-                    skipped += 1
-                    continue
-                names.append(
-                    WorkbookDefinedNameInfo(
-                        name=defined_name.name,
-                        value=defined_name.value or "",
-                        scope=scope,
-                    )
-                )
-
-        collect(book.defined_names, None)
-        for worksheet in book.worksheets:
-            collect(worksheet.defined_names, worksheet.title)
-        return names, skipped
-
-    @staticmethod
-    def _is_useful_defined_name(defined_name: Any) -> bool:
-        """Sponsor models picked up from broker templates carry hundreds of
-        names that are noise when looking for a model's inputs: built-ins
-        (print areas, filters), hidden names, underscore-prefixed print-macro
-        leftovers, array constants, names whose target is an error (#N/A,
-        deleted cells), and links into other workbooks this tool cannot read.
-        They still resolve when requested by name; they are only unlisted."""
-
-        name = defined_name.name or ""
-        value = (defined_name.value or "").strip()
-        if defined_name.is_reserved or getattr(defined_name, "hidden", False):
-            return False
-        if not value or name.startswith("_"):
-            return False
-        if value.startswith("{") or WORKBOOK_ERROR_VALUE.search(value):
-            return False
-        return not WORKBOOK_EXTERNAL_REFERENCE.search(value)
-
-    def _resolve_workbook_range(
-        self,
-        book: Any,
-        request: str | None,
-        *,
-        default_sheet: str | None,
-        extent_of: Callable[[str], tuple[int, int, int, int] | None],
-    ) -> tuple[str, tuple[int, int, int, int] | None]:
-        """Turn an A1 address, ``Sheet!A1:B2``, or a defined name into a sheet
-        and ``(min_col, min_row, max_col, max_row)`` bounds. Whole rows or
-        columns are clamped to the sheet's used range; ``None`` bounds mean
-        the request covers no used cells."""
-
-        sheet_name: str | None = None
-        address: str | None = None
-        if request is not None:
-            text = request.strip()
-            if "!" in text:
-                sheet_part, _, address = text.rpartition("!")
-                sheet_name = self._unquote_sheet_name(sheet_part)
-            else:
-                address = text
-            address = address.replace("$", "").strip()
-            if sheet_name is None and not self._is_a1_reference(address):
-                sheet_name, address = self._resolve_defined_name(
-                    book, text, default_sheet=default_sheet
-                )
-
-        worksheet_name = self._match_worksheet(book, sheet_name or default_sheet)
-        if not address:
-            return worksheet_name, extent_of(worksheet_name)
-
-        try:
-            min_col, min_row, max_col, max_row = range_boundaries(address)
-        except (TypeError, ValueError) as error:
-            raise _WorkbookReadError(
-                f"'{request}' is not an A1 address or defined name"
-            ) from error
-        if None in (min_col, min_row, max_col, max_row):
-            extent = extent_of(worksheet_name)
-            if extent is None:
-                return worksheet_name, None
-            min_col = min_col or extent[0]
-            min_row = min_row or extent[1]
-            max_col = max_col or extent[2]
-            max_row = max_row or extent[3]
-        return worksheet_name, (min_col, min_row, max_col, max_row)
-
-    def _match_worksheet(self, book: Any, sheet_name: str | None) -> str:
-        titles = book.sheetnames
-        if sheet_name is None:
-            if len(titles) == 1:
-                return titles[0]
-            raise _WorkbookReadError(
-                "Workbook has several sheets; qualify the address with a sheet "
-                "name (e.g. 'Unit Mix'!A1:H40) or pass sheet"
-            )
-        if sheet_name in titles:
-            return sheet_name
-        # Excel treats sheet names case-insensitively.
-        for title in titles:
-            if title.casefold() == sheet_name.casefold():
-                return title
-        raise _WorkbookReadError(f"Workbook has no sheet named '{sheet_name}'")
-
-    def _resolve_defined_name(
-        self,
-        book: Any,
-        name: str,
-        *,
-        default_sheet: str | None,
-    ) -> tuple[str, str]:
-        candidates = list(book.defined_names.items())
-        if default_sheet is not None:
-            try:
-                scoped = book[self._match_worksheet(book, default_sheet)]
-            except _WorkbookReadError:
-                scoped = None
-            if scoped is not None:
-                # A sheet-scoped name shadows a workbook name of the same name.
-                candidates = list(scoped.defined_names.items()) + candidates
-        for candidate_name, defined_name in candidates:
-            if candidate_name.casefold() != name.casefold():
-                continue
-            destinations = list(defined_name.destinations)
-            if len(destinations) != 1:
-                raise _WorkbookReadError(
-                    f"Defined name '{name}' does not refer to a single range"
-                )
-            sheet_name, address = destinations[0]
-            return sheet_name.replace("''", "'"), address.replace("$", "")
-        raise _WorkbookReadError(
-            f"'{name}' is not an A1 address or defined name"
-        )
-
-    @staticmethod
-    def _unquote_sheet_name(sheet_part: str) -> str:
-        sheet_part = sheet_part.strip()
-        if len(sheet_part) >= 2 and sheet_part[0] == sheet_part[-1] == "'":
-            return sheet_part[1:-1].replace("''", "'")
-        return sheet_part
-
-    @staticmethod
-    def _is_a1_reference(address: str) -> bool:
-        try:
-            bounds = range_boundaries(address)
-        except (TypeError, ValueError):
-            return False
-        # Without a colon only a full cell (B5) is an address; a bare "IRR" is
-        # a defined name in Excel, not column IRR.
-        return ":" in address or None not in bounds
-
-    @staticmethod
-    def _a1_address(min_col: int, min_row: int, max_col: int, max_row: int) -> str:
-        start = f"{get_column_letter(min_col)}{min_row}"
-        end = f"{get_column_letter(max_col)}{max_row}"
-        return start if start == end else f"{start}:{end}"
-
-    @staticmethod
-    def _workbook_cell_value(value: Any) -> Any:
-        if value is None or isinstance(value, (bool, int, float, str)):
-            return value
-        if isinstance(value, (datetime, date, time)):
-            return value.isoformat()
-        if isinstance(value, timedelta):
-            return str(value)
-        # Array and data-table formulas come back as objects carrying the text.
-        text = getattr(value, "text", None)
-        return text if isinstance(text, str) else str(value)
 
     def _render_pdf_pages(
         self,

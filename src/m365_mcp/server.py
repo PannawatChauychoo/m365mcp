@@ -50,9 +50,11 @@ from m365_mcp.microsoft_graph import (
     DEFAULT_MAX_TOTAL_IMAGE_BYTES,
     DEFAULT_PDF_MAX_BYTES,
     DEFAULT_PDF_PAGE_LONG_EDGE,
+    MicrosoftGraphClient,
+)
+from m365_mcp.workbook_reader import (
     DEFAULT_WORKBOOK_MAX_BYTES,
     DEFAULT_WORKBOOK_MAX_CELLS,
-    MicrosoftGraphClient,
 )
 from m365_mcp.sharepoint_files import (
     DriveItemInfo,
@@ -1013,8 +1015,9 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
             "leave the sheet list out unless includeLayout=true. Values are "
             "what Excel saved with the file — nothing is "
             "recalculated, so a formula never calculated in Excel reads as "
-            "null. One call returns at most maxCells cells; truncated: true "
-            "means request the rest in another call."
+            "null. One call returns at most maxCells cells (capped at 50,000); "
+            "truncated: true means request the rest in another call. "
+            "Attachments over maxBytes (capped at 25 MB) are refused."
         ),
     )
     async def mail_get_attachment_workbook(

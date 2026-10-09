@@ -722,3 +722,139 @@ async def test_get_file_content_reports_download_errors() -> None:
     with pytest.raises(RuntimeError, match=r"download failed \(403\): accessDenied: nope"):
         await client.get_file_content(driveId="drive-1", itemId="item-1")
     await http_client.aclose()
+
+
+def _relabel_main_part(content: bytes, content_type: str) -> bytes:
+    """Save a .docx as another Word package type by swapping its main content type."""
+    import io
+    import zipfile
+
+    docx_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(content)) as source, zipfile.ZipFile(
+        output, "w", zipfile.ZIP_DEFLATED
+    ) as copy:
+        for info in source.infolist():
+            data = source.read(info)
+            if info.filename == "[Content_Types].xml":
+                assert docx_type.encode() in data
+                data = data.replace(docx_type.encode(), content_type.encode())
+            copy.writestr(info.filename, data)
+    return output.getvalue()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("name", "content_type"),
+    [
+        ("Memo.docm", "application/vnd.ms-word.document.macroEnabled.main+xml"),
+        (
+            "Memo.dotx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml",
+        ),
+        ("Memo.dotm", "application/vnd.ms-word.template.macroEnabledTemplate.main+xml"),
+    ],
+)
+async def test_get_file_content_reads_macro_enabled_and_template_word_files(
+    name: str, content_type: str
+) -> None:
+    content = _relabel_main_part(_docx_bytes(), content_type)
+    client, http_client = _make_client(_file_handler(name, content))
+    result = await client.get_file_content(driveId="drive-1", itemId="item-1")
+
+    assert result.unsupportedReason is None
+    assert result.encoding == "docx-markdown"
+    assert result.content.startswith("# Investment Memo\n\n# Summary")
+    await http_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_get_file_content_clamps_max_bytes_and_max_chars() -> None:
+    from m365_mcp.sharepoint_files import MAX_FILE_MAX_BYTES, MAX_FILE_MAX_CHARS
+
+    seen: list[httpx.Request] = []
+    client, http_client = _make_client(
+        _file_handler("huge.txt", b"x", size=MAX_FILE_MAX_BYTES + 1, seen=seen)
+    )
+    by_size = await client.get_file_content(
+        driveId="drive-1", itemId="item-1", maxBytes=10**12
+    )
+    assert by_size.unsupportedReason == f"File size exceeds maxBytes={MAX_FILE_MAX_BYTES}"
+    assert len(seen) == 1
+
+    text = b"y" * (MAX_FILE_MAX_CHARS + 10)
+    client, http_client2 = _make_client(_file_handler("long.txt", text))
+    by_chars = await client.get_file_content(
+        driveId="drive-1", itemId="item-1", maxChars=10**9
+    )
+    assert len(by_chars.content) == MAX_FILE_MAX_CHARS
+    assert by_chars.truncated is True
+    await http_client.aclose()
+    await http_client2.aclose()
+
+
+@pytest.mark.anyio
+async def test_get_file_content_refuses_oversized_word_archive() -> None:
+    import io
+    import zipfile
+
+    from m365_mcp.document_text import MAX_DOCX_INFLATED_BYTES
+
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("word/document.xml", b"\0" * (MAX_DOCX_INFLATED_BYTES + 1))
+    client, http_client = _make_client(_file_handler("Bomb.docx", buffer.getvalue()))
+    result = await client.get_file_content(driveId="drive-1", itemId="item-1")
+
+    assert result.content is None
+    assert f"over the {MAX_DOCX_INFLATED_BYTES}-byte limit" in result.unsupportedReason
+    await http_client.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("via_redirect", [False, True])
+async def test_get_file_content_refuses_non_https_download_urls(via_redirect: bool) -> None:
+    insecure_url = "http://contoso-my.sharepoint.com/download.aspx?tempauth=abc"
+    downloads: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1.0/drives/drive-1/items/item-1":
+            data = {"id": "item-1", "name": "a.txt", "file": {}, "size": 1}
+            if not via_redirect:
+                data["@microsoft.graph.downloadUrl"] = insecure_url
+            return httpx.Response(200, json=data)
+        if request.url.path == "/v1.0/drives/drive-1/items/item-1/content":
+            return httpx.Response(302, headers={"location": insecure_url})
+        downloads.append(request)
+        return httpx.Response(200, content=b"a")
+
+    client, http_client = _make_client(handler)
+    with pytest.raises(RuntimeError, match="not https"):
+        await client.get_file_content(driveId="drive-1", itemId="item-1")
+    assert downloads == []
+    await http_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_get_file_content_parses_off_the_event_loop() -> None:
+    import threading
+
+    from m365_mcp import sharepoint_files
+
+    loop_thread = threading.get_ident()
+    parse_threads: list[int] = []
+
+    def decode(content: bytes) -> str:
+        parse_threads.append(threading.get_ident())
+        return content.decode()
+
+    client, http_client = _make_client(_file_handler("a.txt", b"hello"))
+    original = sharepoint_files.decode_text
+    sharepoint_files.decode_text = decode
+    try:
+        result = await client.get_file_content(driveId="drive-1", itemId="item-1")
+    finally:
+        sharepoint_files.decode_text = original
+    assert result.content == "hello"
+    assert parse_threads and parse_threads[0] != loop_thread
+    await http_client.aclose()

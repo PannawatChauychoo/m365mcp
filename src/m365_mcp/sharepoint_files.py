@@ -42,6 +42,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import quote
 
+import anyio
 import httpx
 from pydantic import BaseModel, Field
 
@@ -58,6 +59,9 @@ from .microsoft_auth import MicrosoftAuthService
 GRAPH_V1 = "https://graph.microsoft.com/v1.0"
 DEFAULT_FILE_MAX_BYTES = 25_000_000
 DEFAULT_FILE_MAX_CHARS = 100_000
+# Ceilings for caller-supplied limits; larger requests are clamped to these.
+MAX_FILE_MAX_BYTES = 50_000_000
+MAX_FILE_MAX_CHARS = 500_000
 _CONTENT_ENCODINGS = {"text": "utf-8", "word": "docx-markdown", "pdf": "pdf-text"}
 
 
@@ -335,14 +339,18 @@ class SharePointFilesClient:
         maxBytes: int = DEFAULT_FILE_MAX_BYTES,
         maxChars: int = DEFAULT_FILE_MAX_CHARS,
     ) -> DriveItemContentResult:
-        """Read a Word (.docx), PDF, or plain-text file as text.
+        """Read a Word (.docx/.docm/.dotx/.dotm), PDF, or plain-text file as text.
 
         Word comes back as Markdown, PDF as its per-page text layer, and text
         files as-is. The file is checked by extension and size before it is
-        downloaded, and parsed in memory; nothing is saved.
+        downloaded, and parsed in memory in a worker thread; nothing is saved.
+        maxBytes and maxChars are clamped to MAX_FILE_MAX_BYTES and
+        MAX_FILE_MAX_CHARS.
         """
         if maxBytes < 1 or maxChars < 1:
             raise ValueError("maxBytes and maxChars must be positive.")
+        maxBytes = min(maxBytes, MAX_FILE_MAX_BYTES)
+        maxChars = min(maxChars, MAX_FILE_MAX_CHARS)
         data = await self._request(
             f"{self._item_path(driveId, itemId)}"
             "?$select=id,name,folder,file,size,webUrl,lastModifiedDateTime,"
@@ -378,13 +386,14 @@ class SharePointFilesClient:
             )
 
         encoding = _CONTENT_ENCODINGS[kind]
+        extract = {
+            "word": extract_docx_markdown,
+            "pdf": extract_pdf_text,
+            "text": decode_text,
+        }[kind]
         try:
-            if kind == "word":
-                content = extract_docx_markdown(content_bytes)
-            elif kind == "pdf":
-                content = extract_pdf_text(content_bytes)
-            else:
-                content = decode_text(content_bytes)
+            # Parsing is CPU-bound; keep it off the event loop.
+            content = await anyio.to_thread.run_sync(extract, content_bytes)
         except DocumentTextError as error:
             return result(encoding=encoding, unsupportedReason=str(error))
 
@@ -699,10 +708,11 @@ class SharePointFilesClient:
 
         The download URL Graph hands out is pre-authenticated and short-lived,
         so the bearer token is never sent to it. Without one, /content answers
-        with a redirect to such a URL, which is followed the same way.
+        with a redirect to such a URL, which is followed the same way. Only
+        https URLs are followed.
         """
         if downloadUrl:
-            url, headers = downloadUrl, {}
+            url, headers = _require_https(downloadUrl), {}
         else:
             access_token = await self._auth_service.get_access_token()
             url = f"{GRAPH_V1}{self._item_path(driveId, itemId)}/content"
@@ -714,7 +724,7 @@ class SharePointFilesClient:
                         location = response.headers.get("location")
                         if not location:
                             break
-                        url, headers = location, {}
+                        url, headers = _require_https(location), {}
                         continue
                     if not response.is_success:
                         await response.aread()
@@ -747,3 +757,9 @@ class SharePointFilesClient:
             message = err.get("message")
             return f"{code}: {message}" if code else message
         return data.get("error_description")
+
+
+def _require_https(url: str) -> str:
+    if httpx.URL(url).scheme != "https":
+        raise RuntimeError("Microsoft Graph Files download URL is not https; refusing it.")
+    return url

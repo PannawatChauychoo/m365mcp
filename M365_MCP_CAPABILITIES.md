@@ -105,11 +105,11 @@ This MCP server gives Claude local delegated access to one Microsoft 365 account
 - Use `sharepoint_list_children` to browse a folder by `driveId` plus an `itemId` or a path relative to the drive root; filter with `extensions` (e.g. `["xlsx", "pdf"]`) or `foldersOnly`.
 - Use `sharepoint_search_in_drive` to search by name inside one library.
 - Use `sharepoint_get_item_by_url` to turn a SharePoint/OneDrive sharing or browser URL into a `driveId` + `itemId`.
-- Use `sharepoint_get_file_content` to read a Word (`.docx`), PDF, or text file (`.md`, `.txt`, `.csv`, `.json`, `.xml`, `.html`, `.yaml`, `.log`) by `driveId` + `itemId`. Nothing is saved to disk.
-  - Word comes back as Markdown (`encoding: "docx-markdown"`): headings as `#`, bullet and numbered paragraphs as list items, and tables as Markdown tables, in document order. Text boxes, headers/footers, footnotes, comments, tracked-change history, and images are not included.
+- Use `sharepoint_get_file_content` to read a Word (`.docx`, `.docm`, `.dotx`, `.dotm`), PDF, or text file (`.md`, `.txt`, `.csv`, `.json`, `.xml`, `.html`, `.yaml`, `.log`) by `driveId` + `itemId`. Nothing is saved to disk.
+  - Word comes back as Markdown (`encoding: "docx-markdown"`): headings as `#`, bullet and numbered paragraphs as list items, and tables as Markdown tables, in document order. Macros in `.docm`/`.dotm` are never run. Text boxes, headers/footers, footnotes, comments, tracked-change history, and images are not included.
   - PDF returns the text layer per page (`encoding: "pdf-text"`). A scanned PDF has no text layer and returns `unsupportedReason`.
   - Text files are returned as-is (`encoding: "utf-8"`).
-  - Output is capped by `maxChars` (default 100,000); a longer document is marked `truncated: true`. Files over `maxBytes` (default 25 MB) are refused before download.
+  - Output is capped by `maxChars` (default 100,000, at most 500,000); a longer document is marked `truncated: true`. Files over `maxBytes` (default 25 MB, at most 50 MB) are refused before download. Word documents that inflate past 50 MB are refused.
   - Excel files are read with the workbook tools. Legacy `.doc`, `.rtf`, and `.odt`, password-protected documents, and other types return `unsupportedReason`.
 - Use `sharepoint_list_permissions` to inspect sharing links, named recipients, roles, and inherited access before making a change.
 - Use `sharepoint_create_link` to create an organization or anonymous view/edit link. Anonymous links can expose the item to anyone who receives the URL.

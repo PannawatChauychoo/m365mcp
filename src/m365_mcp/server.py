@@ -1699,11 +1699,12 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
     @mcp.tool(
         name="sharepoint_get_file_content",
         description=(
-            "Read a Word (.docx), PDF, or text (.md, .txt, .csv, .json, ...) "
-            "file from SharePoint or OneDrive by driveId and itemId. Word comes "
-            "back as Markdown (headings, lists, tables), PDF as its text layer "
-            "per page, and text files as-is. Excel files use the workbook tools; "
-            "other types return unsupportedReason. Nothing is saved to disk."
+            "Read a Word (.docx, .docm, .dotx, .dotm), PDF, or text (.md, .txt, "
+            ".csv, .json, ...) file from SharePoint or OneDrive by driveId and "
+            "itemId. Word comes back as Markdown (headings, lists, tables), PDF "
+            "as its text layer per page, and text files as-is. maxBytes is capped "
+            "at 50 MB and maxChars at 500,000. Excel files use the workbook "
+            "tools; other types return unsupportedReason. Nothing is saved to disk."
         ),
     )
     async def sharepoint_get_file_content(

@@ -4,8 +4,9 @@ Used by sharepoint_files.py to read Word, PDF, and plain-text files stored in
 SharePoint/OneDrive. Everything is parsed in memory; nothing is written to disk.
 
 - Plain text (.md, .txt, .csv, ...) is decoded as UTF-8 (UTF-16 when a BOM says so).
-- Word (.docx) is rendered as Markdown in document order: headings become `#`,
-  list paragraphs become `-` / `1.` items, and tables become Markdown tables.
+- Word (.docx, .docm, .dotx, .dotm) is rendered as Markdown in document order:
+  headings become `#`, list paragraphs become `-` / `1.` items, and tables become
+  Markdown tables. Macros in .docm/.dotm are never run; only the text is read.
 - PDF returns the text layer per page via pypdf; a scan has no text layer.
 
 Both parsers are optional imports, like PdfReader in microsoft_graph.py, so a
@@ -54,7 +55,22 @@ WORKBOOK_EXTENSIONS = {"xlsx", "xlsm", "xltx", "xltm"}
 LEGACY_WORD_EXTENSIONS = {"doc", "dot", "rtf", "odt"}
 
 # A .docx is a zip; refuse archives that inflate past this before parsing them.
-MAX_DOCX_INFLATED_BYTES = 200_000_000
+# zipfile never inflates a member past its declared size, so the sum of declared
+# sizes bounds what python-docx can read into memory.
+MAX_DOCX_INFLATED_BYTES = 50_000_000
+
+# python-docx only opens a package whose main part has the .docx content type.
+# Macro-enabled documents and templates use the same WordprocessingML under a
+# different content type, so it is swapped for the .docx one before parsing.
+_DOCX_MAIN_CONTENT_TYPE = (
+    b"application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"
+)
+_OTHER_WORD_MAIN_CONTENT_TYPES = (
+    b"application/vnd.ms-word.document.macroEnabled.main+xml",
+    b"application/vnd.openxmlformats-officedocument.wordprocessingml.template.main+xml",
+    b"application/vnd.ms-word.template.macroEnabledTemplate.main+xml",
+)
+_CONTENT_TYPES_PART = "[Content_Types].xml"
 
 _HEADING_STYLE = re.compile(r"^Heading (\d)$")
 
@@ -120,7 +136,7 @@ def extract_docx_markdown(content: bytes) -> str:
         raise DocumentTextError("Word text extraction requires the python-docx package")
     _check_docx_archive(content)
     try:
-        document = DocxDocument(io.BytesIO(content))
+        document = DocxDocument(io.BytesIO(_as_docx_package(content)))
         blocks: list[tuple[bool, str]] = []
         for block in document.iter_inner_content():
             if isinstance(block, DocxTable):
@@ -157,6 +173,30 @@ def _check_docx_archive(content: bytes) -> None:
             f"Word document inflates to {inflated} bytes, over the "
             f"{MAX_DOCX_INFLATED_BYTES}-byte limit"
         )
+
+
+def _as_docx_package(content: bytes) -> bytes:
+    """Return the package with a .docm/.dotx/.dotm main part relabelled as .docx."""
+    with zipfile.ZipFile(io.BytesIO(content)) as archive:
+        try:
+            content_types = archive.read(_CONTENT_TYPES_PART)
+        except KeyError:
+            return content
+        relabelled = content_types
+        for content_type in _OTHER_WORD_MAIN_CONTENT_TYPES:
+            relabelled = relabelled.replace(content_type, _DOCX_MAIN_CONTENT_TYPE)
+        if relabelled == content_types:
+            return content
+        output = io.BytesIO()
+        with zipfile.ZipFile(output, "w", zipfile.ZIP_STORED) as copy:
+            for info in archive.infolist():
+                data = (
+                    relabelled
+                    if info.filename == _CONTENT_TYPES_PART
+                    else archive.read(info)
+                )
+                copy.writestr(info.filename, data)
+    return output.getvalue()
 
 
 def _paragraph_markdown(paragraph) -> tuple[str, bool]:

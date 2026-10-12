@@ -109,7 +109,7 @@ This MCP server gives Claude local delegated access to one Microsoft 365 account
   - Word comes back as Markdown (`encoding: "docx-markdown"`): headings as `#`, bullet and numbered paragraphs as list items, and tables as Markdown tables, in document order. Macros in `.docm`/`.dotm` are never run. Text boxes, headers/footers, footnotes, comments, tracked-change history, and images are not included.
   - PDF returns the text layer per page (`encoding: "pdf-text"`). A scanned PDF has no text layer and returns `unsupportedReason`.
   - Text files are returned as-is (`encoding: "utf-8"`).
-  - Output is capped by `maxChars` (default 100,000, at most 500,000); a longer document is marked `truncated: true`. Files over `maxBytes` (default 25 MB, at most 50 MB) are refused before download. Word documents that inflate past 50 MB are refused.
+  - Output is capped by `maxChars` (default 100,000, at most 500,000); a longer document is marked `truncated: true`. Files over `maxBytes` (default 25 MB, at most 50 MB) are refused before download. Word documents that inflate past 50 MB (or more than 100 times their compressed size) are refused. Reading stops once `maxChars` is reached, and PDFs are read for at most their first 500 pages, so `truncated: true` can also mean later pages were not read.
   - Excel files are read with the workbook tools. Legacy `.doc`, `.rtf`, and `.odt`, password-protected documents, and other types return `unsupportedReason`.
 - Use `sharepoint_list_permissions` to inspect sharing links, named recipients, roles, and inherited access before making a change.
 - Use `sharepoint_create_link` to create an organization or anonymous view/edit link. Anonymous links can expose the item to anyone who receives the URL.

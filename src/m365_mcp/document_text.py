@@ -12,7 +12,9 @@ SharePoint/OneDrive. Everything is parsed in memory; nothing is written to disk.
 Both parsers are optional imports, like PdfReader in microsoft_graph.py, so a
 missing dependency becomes a readable reason instead of an import error.
 Unreadable files raise DocumentTextError, which callers turn into an
-unsupportedReason.
+unsupportedReason. Extraction stops once it has more than ``max_chars``
+characters (and PDFs after MAX_PDF_PAGES pages), so a large or crafted file
+cannot keep a worker thread busy for long.
 """
 
 from __future__ import annotations
@@ -21,6 +23,9 @@ import codecs
 import io
 import re
 import zipfile
+from dataclasses import dataclass
+
+from .zip_guard import NotAZipError, ZipGuardError, check_zip_archive
 
 try:
     from pypdf import PdfReader
@@ -54,10 +59,13 @@ PDF_EXTENSIONS = {"pdf"}
 WORKBOOK_EXTENSIONS = {"xlsx", "xlsm", "xltx", "xltm"}
 LEGACY_WORD_EXTENSIONS = {"doc", "dot", "rtf", "odt"}
 
-# A .docx is a zip; refuse archives that inflate past this before parsing them.
-# zipfile never inflates a member past its declared size, so the sum of declared
-# sizes bounds what python-docx can read into memory.
+# A .docx is a zip; refuse archives that inflate past this (counted by actually
+# inflating every member, see zip_guard.py) before python-docx opens them.
 MAX_DOCX_INFLATED_BYTES = 50_000_000
+MAX_DOCX_COMPRESSION_RATIO = 100
+MAX_DOCX_ARCHIVE_MEMBERS = 10_000
+# Pages past this are not read, even when they hold no text (a scan).
+MAX_PDF_PAGES = 500
 
 # python-docx only opens a package whose main part has the .docx content type.
 # Macro-enabled documents and templates use the same WordprocessingML under a
@@ -77,6 +85,36 @@ _HEADING_STYLE = re.compile(r"^Heading (\d)$")
 
 class DocumentTextError(Exception):
     """A file could not be turned into text; the message is the reason."""
+
+
+@dataclass
+class ExtractedText:
+    """At most ``max_chars`` characters of a file's text. ``truncated`` is
+    true when the file holds more than was returned."""
+
+    content: str
+    truncated: bool
+
+
+def extract_text(kind: str, content: bytes, *, max_chars: int) -> ExtractedText:
+    """Extract text for a ``file_kind`` result, bounded by ``max_chars``.
+
+    Any parser failure becomes DocumentTextError."""
+    extract = {
+        "word": extract_docx_markdown,
+        "pdf": extract_pdf_text,
+        "text": lambda data, max_chars: (decode_text(data), False),
+    }[kind]
+    try:
+        text, stopped_early = extract(content, max_chars=max_chars)
+    except DocumentTextError:
+        raise
+    except Exception as error:  # pragma: no cover - parsers wrap their own
+        raise DocumentTextError(f"Could not read file: {error}") from error
+    return ExtractedText(
+        content=text[:max_chars],
+        truncated=stopped_early or len(text) > max_chars,
+    )
 
 
 def file_kind(extension: str | None) -> str | None:
@@ -112,39 +150,54 @@ def decode_text(content: bytes) -> str:
     return content.decode("utf-8-sig", errors="replace")
 
 
-def extract_pdf_text(content: bytes) -> str:
+def extract_pdf_text(content: bytes, *, max_chars: int) -> tuple[str, bool]:
+    """Return the PDF's text layer and whether pages were left unread."""
     if PdfReader is None:
         raise DocumentTextError("PDF text extraction requires the pypdf package")
     try:
         reader = PdfReader(io.BytesIO(content))
         if reader.is_encrypted and not reader.decrypt(""):
             raise DocumentTextError("PDF is password-protected")
+        page_count = len(reader.pages)
         pages: list[str] = []
-        for index, page in enumerate(reader.pages, start=1):
-            text = page.extract_text() or ""
-            if text.strip():
-                pages.append(f"--- Page {index} ---\n{text.strip()}")
+        length = 0
+        stopped_early = False
+        for index in range(page_count):
+            if index >= MAX_PDF_PAGES or length > max_chars:
+                stopped_early = True
+                break
+            text = (reader.pages[index].extract_text() or "").strip()
+            if text:
+                pages.append(f"--- Page {index + 1} ---\n{text}")
+                length += len(pages[-1]) + 2
     except DocumentTextError:
         raise
     except Exception as error:
         raise DocumentTextError(f"Could not read PDF: {error}") from error
-    return "\n\n".join(pages)
+    return "\n\n".join(pages), stopped_early
 
 
-def extract_docx_markdown(content: bytes) -> str:
+def extract_docx_markdown(content: bytes, *, max_chars: int) -> tuple[str, bool]:
+    """Return the document as Markdown and whether blocks were left unread."""
     if DocxDocument is None:
         raise DocumentTextError("Word text extraction requires the python-docx package")
     _check_docx_archive(content)
     try:
         document = DocxDocument(io.BytesIO(_as_docx_package(content)))
         blocks: list[tuple[bool, str]] = []
+        length = 0
+        stopped_early = False
         for block in document.iter_inner_content():
+            if length > max_chars:
+                stopped_early = True
+                break
             if isinstance(block, DocxTable):
                 text, is_list_item = _table_markdown(block), False
             else:
                 text, is_list_item = _paragraph_markdown(block)
             if text:
                 blocks.append((is_list_item, text))
+                length += len(text) + 2
     except Exception as error:
         raise DocumentTextError(f"Could not read Word document: {error}") from error
 
@@ -156,23 +209,25 @@ def extract_docx_markdown(content: bytes) -> str:
             parts.append("\n" if is_list_item and previous_was_list_item else "\n\n")
         parts.append(text)
         previous_was_list_item = is_list_item
-    return "".join(parts)
+    return "".join(parts), stopped_early
 
 
 def _check_docx_archive(content: bytes) -> None:
     try:
-        with zipfile.ZipFile(io.BytesIO(content)) as archive:
-            inflated = sum(info.file_size for info in archive.infolist())
-    except zipfile.BadZipFile as error:
-        raise DocumentTextError(
-            "File is not a valid .docx; it may be password-protected or a "
-            "legacy .doc renamed to .docx"
-        ) from error
-    if inflated > MAX_DOCX_INFLATED_BYTES:
-        raise DocumentTextError(
-            f"Word document inflates to {inflated} bytes, over the "
-            f"{MAX_DOCX_INFLATED_BYTES}-byte limit"
+        check_zip_archive(
+            content,
+            max_inflated_bytes=MAX_DOCX_INFLATED_BYTES,
+            max_ratio=MAX_DOCX_COMPRESSION_RATIO,
+            max_members=MAX_DOCX_ARCHIVE_MEMBERS,
+            label="Word document",
         )
+    except NotAZipError as error:
+        raise DocumentTextError(
+            "File is not a valid .docx; it may be truncated, "
+            "password-protected, or a legacy .doc renamed to .docx"
+        ) from error
+    except ZipGuardError as error:
+        raise DocumentTextError(str(error)) from error
 
 
 def _as_docx_package(content: bytes) -> bytes:

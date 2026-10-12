@@ -38,6 +38,7 @@ Endpoint reference (Graph v1.0):
 from __future__ import annotations
 
 import base64
+import functools
 from contextlib import asynccontextmanager
 from typing import Any
 from urllib.parse import quote
@@ -48,9 +49,7 @@ from pydantic import BaseModel, Field
 
 from .document_text import (
     DocumentTextError,
-    decode_text,
-    extract_docx_markdown,
-    extract_pdf_text,
+    extract_text,
     file_kind,
     unreadable_reason,
 )
@@ -386,18 +385,15 @@ class SharePointFilesClient:
             )
 
         encoding = _CONTENT_ENCODINGS[kind]
-        extract = {
-            "word": extract_docx_markdown,
-            "pdf": extract_pdf_text,
-            "text": decode_text,
-        }[kind]
         try:
             # Parsing is CPU-bound; keep it off the event loop.
-            content = await anyio.to_thread.run_sync(extract, content_bytes)
+            extracted = await anyio.to_thread.run_sync(
+                functools.partial(extract_text, kind, content_bytes, max_chars=maxChars)
+            )
         except DocumentTextError as error:
             return result(encoding=encoding, unsupportedReason=str(error))
 
-        if kind != "text" and not content.strip():
+        if kind != "text" and not extracted.content.strip():
             return result(
                 encoding=encoding,
                 unsupportedReason=(
@@ -407,9 +403,9 @@ class SharePointFilesClient:
                 ),
             )
         return result(
-            content=content[:maxChars],
+            content=extracted.content,
             encoding=encoding,
-            truncated=len(content) > maxChars,
+            truncated=extracted.truncated,
         )
 
     # ---- sharing ---------------------------------------------------------- #

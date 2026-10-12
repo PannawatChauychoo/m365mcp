@@ -807,7 +807,7 @@ async def test_get_file_content_refuses_oversized_word_archive() -> None:
     result = await client.get_file_content(driveId="drive-1", itemId="item-1")
 
     assert result.content is None
-    assert f"over the {MAX_DOCX_INFLATED_BYTES}-byte limit" in result.unsupportedReason
+    assert "Word document expands to more than" in result.unsupportedReason
     await http_client.aclose()
 
 
@@ -839,7 +839,7 @@ async def test_get_file_content_refuses_non_https_download_urls(via_redirect: bo
 async def test_get_file_content_parses_off_the_event_loop() -> None:
     import threading
 
-    from m365_mcp import sharepoint_files
+    from m365_mcp import document_text
 
     loop_thread = threading.get_ident()
     parse_threads: list[int] = []
@@ -849,12 +849,98 @@ async def test_get_file_content_parses_off_the_event_loop() -> None:
         return content.decode()
 
     client, http_client = _make_client(_file_handler("a.txt", b"hello"))
-    original = sharepoint_files.decode_text
-    sharepoint_files.decode_text = decode
+    original = document_text.decode_text
+    document_text.decode_text = decode
     try:
         result = await client.get_file_content(driveId="drive-1", itemId="item-1")
     finally:
-        sharepoint_files.decode_text = original
+        document_text.decode_text = original
     assert result.content == "hello"
     assert parse_threads and parse_threads[0] != loop_thread
+    await http_client.aclose()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("name", "reason_fragment"),
+    [("Memo.docx", "not a valid .docx"), ("OM.pdf", "Could not read PDF")],
+)
+async def test_get_file_content_reports_truncated_documents(
+    name: str, reason_fragment: str
+) -> None:
+    from tests.test_graph import _single_page_pdf
+
+    whole = _docx_bytes() if name.endswith(".docx") else _single_page_pdf(text=b"RENT", pages=3)
+    client, http_client = _make_client(_file_handler(name, whole[: len(whole) // 2]))
+    result = await client.get_file_content(driveId="drive-1", itemId="item-1")
+
+    assert result.content is None
+    assert reason_fragment in result.unsupportedReason
+    await http_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_get_file_content_stops_reading_pdf_pages_at_max_chars(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pypdf import PageObject
+
+    from tests.test_graph import _single_page_pdf
+
+    pages_read: list[int] = []
+    original = PageObject.extract_text
+
+    def counting_extract_text(self, *args, **kwargs):
+        pages_read.append(1)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(PageObject, "extract_text", counting_extract_text)
+    client, http_client = _make_client(
+        _file_handler("OM.pdf", _single_page_pdf(text=b"RENT ROLL", pages=6))
+    )
+    result = await client.get_file_content(driveId="drive-1", itemId="item-1", maxChars=30)
+
+    # Each page is ~28 characters, so the limit is passed on the second page
+    # and the remaining four are never parsed.
+    assert len(pages_read) == 2
+    assert result.truncated is True
+    assert len(result.content) == 30
+    assert result.content.startswith("--- Page 1 ---\nRENT ROLL p1")
+    await http_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_get_file_content_caps_pdf_pages(monkeypatch: pytest.MonkeyPatch) -> None:
+    from m365_mcp import document_text
+    from tests.test_graph import _single_page_pdf
+
+    monkeypatch.setattr(document_text, "MAX_PDF_PAGES", 2)
+    client, http_client = _make_client(
+        _file_handler("OM.pdf", _single_page_pdf(text=b"RENT ROLL", pages=3))
+    )
+    result = await client.get_file_content(driveId="drive-1", itemId="item-1")
+
+    assert "RENT ROLL p2" in result.content
+    assert "RENT ROLL p3" not in result.content
+    assert result.truncated is True
+    await http_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_get_file_content_stops_reading_word_at_max_chars() -> None:
+    import io
+
+    from docx import Document
+
+    document = Document()
+    for index in range(200):
+        document.add_paragraph(f"Paragraph {index} " + "x" * 50)
+    buffer = io.BytesIO()
+    document.save(buffer)
+    client, http_client = _make_client(_file_handler("Long.docx", buffer.getvalue()))
+    result = await client.get_file_content(driveId="drive-1", itemId="item-1", maxChars=100)
+
+    assert result.truncated is True
+    assert len(result.content) == 100
+    assert result.content.startswith("Paragraph 0 ")
     await http_client.aclose()

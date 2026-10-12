@@ -521,6 +521,46 @@ async def test_mcp_server_stays_up_when_helper_port_is_busy(config_factory) -> N
 
 
 @pytest.mark.anyio
+async def test_mcp_server_stays_up_when_helper_port_is_taken_after_check(
+    config_factory, monkeypatch
+) -> None:
+    # Claude Desktop starts two copies at once; both can pass the free-port
+    # check before either binds, so the loser only finds out from uvicorn.
+    monkeypatch.setattr("m365_mcp.server._can_bind_localhost", lambda port: True)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen()
+    port = sock.getsockname()[1]
+
+    http_client = httpx.AsyncClient()
+    runtime = RuntimeServices(
+        config=config_factory(
+            port=port,
+            localBaseUrl=f"http://localhost:{port}",
+        ),
+        microsoft_auth=StubAuthService(),
+        graph=StubGraphClient(),
+        sharepoint=SharePointFilesClient(StubAuthService(), http_client),
+        excel=ExcelWorkbookClient(StubAuthService(), http_client),
+        http_client=http_client,
+        owns_http_client=False,
+        start_helper_server=True,
+    )
+    server = create_mcp_server(runtime)
+
+    try:
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as session:
+            auth_status = await session.call_tool("auth_status", {})
+            assert auth_status.structuredContent["connected"] is True
+    finally:
+        sock.close()
+        await http_client.aclose()
+
+
+@pytest.mark.anyio
 async def test_mcp_server_writes_redacted_audit_records(config_factory, tmp_path) -> None:
     audit_file = tmp_path / "audit" / "m365.jsonl"
     graph = StubGraphClient()

@@ -309,8 +309,10 @@ class MailAttachmentPdfResult(AppModel):
 class MailThreadResult(AppModel):
     mailbox: str
     conversationId: str
-    order: Literal["newest", "oldest"] = "oldest"
+    order: Literal["newest", "oldest"] = "newest"
+    # Thread size; None when the thread has more messages than were returned.
     messageCount: int | None = None
+    # True when the thread holds more messages than `messages`.
     truncated: bool = False
     messages: list[MessageSummary]
 

@@ -747,11 +747,14 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
             "Get the details and body of one message by ID. By default the body "
             "is plain text and only the part new to this message (no quoted "
             "thread), which is far smaller than the raw HTML; message.bodyScope "
-            "says whether the new part or the full body came back. Set "
-            'bodyScope="full" for the whole body including quoted history, and '
-            'bodyFormat="html" for the original HTML (needed to match cid: '
-            "inline images). Use mail_get_messages to read several messages in "
-            "one call. Use mailbox for shared/delegated mailboxes."
+            "says whether the new part or the full body came back. Forwards "
+            "(FW:/Fwd:) always get the full body so the forwarded message is "
+            "kept. The new part can miss answers typed inline into quoted "
+            "text; if the new part refers to answers inline or below, read "
+            'again with bodyScope="full". bodyFormat="html" returns the '
+            "original HTML (needed to match cid: inline images). Use "
+            "mail_get_messages to read several messages in one call. Use "
+            "mailbox for shared/delegated mailboxes."
         ),
     )
     async def mail_get(
@@ -978,8 +981,10 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
         description=(
             "View the pictures embedded in a message body. Returns each inline "
             "image as image content, keyed by the contentId that the HTML body "
-            "references as cid:. Set includeNonInline to also pull regular "
-            "image attachments."
+            "references as cid:. To see where each image sits, read the body "
+            'with mail_get bodyFormat="html" and bodyScope="full"; the default '
+            "plain-text body has no cid: references. Set includeNonInline to "
+            "also pull regular image attachments."
         ),
         structured_output=False,
     )
@@ -1042,10 +1047,10 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
         description=(
             "Get message summaries in the same conversation by messageId or "
             "conversationId, including sent replies. Returns the newest `top` "
-            'messages newest first by default; order="oldest" returns the '
-            "oldest `top` oldest first. messageCount is the thread size and "
-            "truncated is true when messages were left out. Read bodies with "
-            "mail_get_messages."
+            "(max 100) messages newest first by default; order=\"oldest\" "
+            "returns the oldest `top` oldest first. truncated is true when the "
+            "thread has more messages; messageCount is the thread size, or null "
+            "when truncated. Read bodies with mail_get_messages."
         ),
     )
     async def mail_get_thread(

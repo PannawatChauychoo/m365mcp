@@ -6,8 +6,9 @@ import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
+import anyio
 import httpx
 
 try:  # pragma: no cover - exercised through dependency-aware tests
@@ -106,9 +107,19 @@ MESSAGE_FULL_SELECT = (
 # Upper bound for mail_get_messages; Graph $batch takes 20 per call, so this
 # is at most three round trips.
 MAIL_GET_MESSAGES_LIMIT = 50
-# How many thread messages get_thread reads before sorting. The filter cannot
-# be combined with $orderby, so the whole thread is read and sorted locally.
-THREAD_FETCH_LIMIT = 500
+# Throttled (429) or briefly unavailable $batch sub-requests are retried this
+# many times, waiting for the longest Retry-After (capped) between attempts.
+BATCH_THROTTLE_RETRIES = 3
+BATCH_RETRY_STATUSES = {429, 503, 504}
+BATCH_MAX_RETRY_AFTER_SECONDS = 30.0
+# Graph only accepts $orderby with $filter when the sorted property is
+# filtered first, so thread reads lead with this no-op bound.
+THREAD_DATE_FLOOR = "receivedDateTime ge 1900-01-01T00:00:00Z"
+# "FW:", "Fwd:", "[EXT] FW:", "RE: FW:"... Forwarded content is not part of
+# uniqueBody, so these always get the full body.
+_FORWARD_SUBJECT_RE = re.compile(
+    r"^\s*(?:\[[^\]]*\]\s*|(?:re|aw|sv)\s*:\s*)*fwd?\s*:", re.IGNORECASE
+)
 _HTML_TAG_RE = re.compile(
     r"<(head|style|script)\b.*?</\1\s*>|<[^>]*>", re.IGNORECASE | re.DOTALL
 )
@@ -1203,37 +1214,34 @@ class MicrosoftGraphClient:
             )
             resolved_conversation_id = str(message["conversationId"])
 
+        limit = max(1, min(top, 100))
+        # One request: Graph sorts and limits server-side. It only accepts
+        # $orderby with $filter when the sorted property is filtered first,
+        # hence the leading no-op date bound.
         params = httpx.QueryParams(
             {
-                "$top": "100",
+                "$top": str(limit),
                 "$select": MESSAGE_SUMMARY_SELECT,
                 "$filter": (
-                    "conversationId eq "
+                    f"{THREAD_DATE_FLOOR} and conversationId eq "
                     f"'{self._escape_odata_string(resolved_conversation_id)}'"
                 ),
+                "$orderby": f"receivedDateTime {'desc' if order == 'newest' else 'asc'}",
             }
         )
-        # Graph returns the filtered messages in no particular order, so read
-        # the whole thread (bounded) before picking the newest/oldest `top`.
-        raw_messages: list[dict[str, Any]] = []
-        next_path: str | None = f"{base}/messages?{params}"
-        while next_path and len(raw_messages) < THREAD_FETCH_LIMIT:
-            result = await self._request(next_path)
-            raw_messages.extend(result.get("value") or [])
-            next_path = self._nullable_string(result.get("@odata.nextLink"))
-        messages = [self._map_message_summary(message) for message in raw_messages]
-        messages.sort(
-            key=lambda message: message.receivedDateTime or "",
-            reverse=order == "newest",
-        )
-        limit = max(1, min(top, 100))
+        result = await self._request(f"{base}/messages?{params}")
+        messages = [
+            self._map_message_summary(message) for message in result.get("value") or []
+        ]
+        truncated = bool(result.get("@odata.nextLink"))
         return MailThreadResult(
             mailbox=normalized_mailbox or "me",
             conversationId=resolved_conversation_id,
             order=order,
-            messageCount=len(messages),
-            truncated=len(messages) > limit or next_path is not None,
-            messages=messages[:limit],
+            # Only exact when the whole thread fit in one page.
+            messageCount=None if truncated else len(messages),
+            truncated=truncated,
+            messages=messages,
         )
 
     async def create_reply_draft(
@@ -2127,6 +2135,12 @@ class MicrosoftGraphClient:
         headers: dict[str, str] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> Any:
+        # Absolute URLs come from Graph's @odata.nextLink; never send the
+        # bearer token anywhere but Graph.
+        if path.startswith("https://") and (
+            urlsplit(path).hostname != "graph.microsoft.com"
+        ):
+            raise ValueError("Refusing to send a request outside graph.microsoft.com")
         access_token = await self._auth_service.get_access_token()
         request_headers = {
             "Accept": "application/json",
@@ -2184,11 +2198,45 @@ class MicrosoftGraphClient:
         relative to ``/v1.0``. Returns raw inner responses keyed by id."""
         responses: dict[str, dict[str, Any]] = {}
         for start in range(0, len(requests), 20):
-            payload = {"requests": requests[start : start + 20]}
-            data = await self._request("/$batch", method="POST", json_body=payload)
-            for response in (data or {}).get("responses", []):
-                responses[str(response.get("id"))] = response
+            pending = requests[start : start + 20]
+            # Every sub-request hits the same mailbox, so per-item throttling
+            # is common; retry those, honouring Retry-After, before giving up.
+            for attempt in range(BATCH_THROTTLE_RETRIES + 1):
+                data = await self._request(
+                    "/$batch", method="POST", json_body={"requests": pending}
+                )
+                for response in (data or {}).get("responses", []):
+                    responses[str(response.get("id"))] = response
+                throttled = [
+                    request
+                    for request in pending
+                    if responses.get(str(request["id"]), {}).get("status")
+                    in BATCH_RETRY_STATUSES
+                ]
+                if not throttled or attempt == BATCH_THROTTLE_RETRIES:
+                    break
+                await anyio.sleep(
+                    max(
+                        self._retry_after_seconds(responses[str(request["id"])], attempt)
+                        for request in throttled
+                    )
+                )
+                pending = throttled
         return responses
+
+    @staticmethod
+    def _retry_after_seconds(response: dict[str, Any], attempt: int) -> float:
+        """Seconds to wait before retrying a throttled ``$batch`` item."""
+        headers = response.get("headers") or {}
+        value = next(
+            (v for k, v in headers.items() if str(k).lower() == "retry-after"),
+            None,
+        )
+        try:
+            seconds = float(value) if value is not None else 2.0**attempt
+        except (TypeError, ValueError):
+            seconds = 2.0**attempt
+        return min(max(seconds, 0.0), BATCH_MAX_RETRY_AFTER_SECONDS)
 
     @staticmethod
     def _batch_error(response: dict[str, Any] | None) -> str | None:
@@ -2865,9 +2913,14 @@ class MicrosoftGraphClient:
         body = message.get("body") or {}
         returned_scope = "full"
         unique_body = message.get("uniqueBody") or {}
-        # uniqueBody can come back empty (or as an empty HTML shell); then the
-        # full body is the only way to show what the message says.
-        if bodyScope == "new" and self._has_visible_text(unique_body):
+        # uniqueBody can come back empty (or as an empty HTML shell), and for
+        # a forward it leaves out the forwarded message, which is the point
+        # of the mail; in both cases return the full body.
+        if (
+            bodyScope == "new"
+            and not _FORWARD_SUBJECT_RE.match(str(message.get("subject") or ""))
+            and self._has_visible_text(unique_body)
+        ):
             body = unique_body
             returned_scope = "new"
         return FullMessage(

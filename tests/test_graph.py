@@ -261,7 +261,135 @@ async def test_get_messages_batches_reads_and_keeps_order() -> None:
 
 
 @pytest.mark.anyio
-async def test_get_thread_reads_all_pages_and_returns_newest_first() -> None:
+async def test_get_messages_retries_throttled_items(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(graph_module.anyio, "sleep", fake_sleep)
+    attempts: dict[str, int] = {}
+    batch_sizes: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        batch_sizes.append(len(payload["requests"]))
+        responses = []
+        for inner in payload["requests"]:
+            message_id = inner["url"].split("/messages/", 1)[1].split("?", 1)[0]
+            attempts[message_id] = attempts.get(message_id, 0) + 1
+            # m1 is throttled once, m2 always; m0 succeeds first time.
+            if (message_id == "m1" and attempts[message_id] == 1) or message_id == "m2":
+                responses.append(
+                    {
+                        "id": inner["id"],
+                        "status": 429,
+                        "headers": {"Retry-After": "7"},
+                        "body": {"error": {"code": "TooManyRequests", "message": "slow down"}},
+                    }
+                )
+                continue
+            responses.append(
+                {
+                    "id": inner["id"],
+                    "status": 200,
+                    "body": {
+                        "id": message_id,
+                        "subject": "",
+                        "bodyPreview": "",
+                        "isDraft": False,
+                        "body": {"contentType": "text", "content": message_id},
+                    },
+                }
+            )
+        return httpx.Response(200, json={"responses": responses})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    graph = MicrosoftGraphClient(StaticAuthService(), client)
+
+    result = await graph.get_messages(messageIds=["m0", "m1", "m2"])
+
+    # Only the throttled items are resent, and Retry-After is honoured.
+    assert batch_sizes == [3, 2, 1, 1]
+    assert sleeps == [7.0, 7.0, 7.0]
+    assert attempts == {"m0": 1, "m1": 2, "m2": 4}
+    assert result.messages[0].message.id == "m0"
+    assert result.messages[1].message.id == "m1"
+    assert result.messages[2].message is None
+    assert "429" in result.messages[2].error
+
+    await client.aclose()
+
+
+def test_batch_retry_after_is_bounded() -> None:
+    wait = MicrosoftGraphClient._retry_after_seconds
+    assert wait({"headers": {"retry-after": "3"}}, 0) == 3.0
+    assert wait({"headers": {"Retry-After": "3600"}}, 0) == 30.0
+    # Missing or unparseable Retry-After backs off exponentially.
+    assert wait({}, 0) == 1.0
+    assert wait({"headers": {"Retry-After": "soon"}}, 2) == 4.0
+
+
+@pytest.mark.anyio
+async def test_get_message_returns_full_body_for_forwards() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        message_id = request.url.path.rsplit("/", 1)[1]
+        subjects = {
+            "fw": "FW: Rent roll",
+            "fwd": "Fwd: Rent roll",
+            "re-fw": "RE: [EXT] Fw: Rent roll",
+            "reply": "RE: Rent roll forward plan",
+        }
+        return httpx.Response(
+            200,
+            json={
+                "id": message_id,
+                "subject": subjects[message_id],
+                "bodyPreview": "",
+                "isDraft": False,
+                "body": {
+                    "contentType": "text",
+                    "content": "See below.\n---------- Forwarded message ----------\nRent roll attached.",
+                },
+                "uniqueBody": {"contentType": "text", "content": "See below."},
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    graph = MicrosoftGraphClient(StaticAuthService(), client)
+
+    for message_id in ("fw", "fwd", "re-fw"):
+        forwarded = await graph.get_message(messageId=message_id)
+        assert forwarded.message.bodyScope == "full", message_id
+        assert "Rent roll attached." in forwarded.message.body.content
+
+    reply = await graph.get_message(messageId="reply")
+    assert reply.message.bodyScope == "new"
+    assert reply.message.body.content == "See below."
+
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_request_refuses_absolute_urls_outside_graph() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"Unexpected request: {request.url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    graph = MicrosoftGraphClient(StaticAuthService(), client)
+
+    for url in (
+        "https://evil.example/v1.0/me/messages?$skiptoken=abc",
+        "https://graph.microsoft.com.evil.example/v1.0/me/messages",
+    ):
+        with pytest.raises(ValueError, match="graph.microsoft.com"):
+            await graph._request(url)
+
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_get_thread_sorts_and_limits_on_graph_in_one_request() -> None:
     def message(index: int) -> dict[str, object]:
         return {
             "id": f"t{index}",
@@ -272,38 +400,51 @@ async def test_get_thread_reads_all_pages_and_returns_newest_first() -> None:
             "receivedDateTime": f"2026-05-{index + 1:02d}T12:00:00Z",
         }
 
-    page_requests: list[str] = []
+    thread = [message(index) for index in range(5)]
+    requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        page_requests.append(str(request.url))
-        if "skiptoken" in str(request.url):
-            # Second page holds the oldest messages.
-            return httpx.Response(200, json={"value": [message(0), message(1)]})
-        assert request.url.params["$top"] == "100"
-        assert "$orderby" not in request.url.params
-        return httpx.Response(
-            200,
-            json={
-                "value": [message(3), message(2), message(4)],
-                "@odata.nextLink": (
-                    "https://graph.microsoft.com/v1.0/me/messages?$skiptoken=abc"
-                ),
-            },
+        requests.append(request)
+        params = request.url.params
+        # The sorted property must lead the filter for Graph to accept $orderby.
+        assert params["$filter"] == (
+            "receivedDateTime ge 1900-01-01T00:00:00Z and conversationId eq 'conv-9'"
         )
+        top = int(params["$top"])
+        ordered = sorted(
+            thread,
+            key=lambda item: str(item["receivedDateTime"]),
+            reverse=params["$orderby"] == "receivedDateTime desc",
+        )
+        body: dict[str, object] = {"value": ordered[:top]}
+        if top < len(ordered):
+            body["@odata.nextLink"] = (
+                "https://graph.microsoft.com/v1.0/me/messages?$skiptoken=abc"
+            )
+        return httpx.Response(200, json=body)
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     graph = MicrosoftGraphClient(StaticAuthService(), client)
 
     latest = await graph.get_thread(conversationId="conv-9", top=2)
-    assert len(page_requests) == 2
+    assert len(requests) == 1
+    assert requests[-1].url.params["$top"] == "2"
+    assert requests[-1].url.params["$orderby"] == "receivedDateTime desc"
     assert [item.id for item in latest.messages] == ["t4", "t3"]
     assert latest.order == "newest"
-    assert latest.messageCount == 5
+    # More messages exist, so the size is unknown rather than reported as 2.
     assert latest.truncated is True
+    assert latest.messageCount is None
 
     earliest = await graph.get_thread(conversationId="conv-9", top=10, order="oldest")
+    assert len(requests) == 2
+    assert requests[-1].url.params["$orderby"] == "receivedDateTime asc"
     assert [item.id for item in earliest.messages] == ["t0", "t1", "t2", "t3", "t4"]
     assert earliest.truncated is False
+    assert earliest.messageCount == 5
+
+    await graph.get_thread(conversationId="conv-9", top=500)
+    assert requests[-1].url.params["$top"] == "100"
 
     with pytest.raises(ValueError, match="order"):
         await graph.get_thread(conversationId="conv-9", order="latest")
@@ -876,29 +1017,30 @@ async def test_attachments_threads_and_categories() -> None:
         if request.url.path.endswith(
             "/messages"
         ) and "conversationId" in request.url.params.get("$filter", ""):
-            assert "$orderby" not in request.url.params
+            assert request.url.params["$orderby"].startswith("receivedDateTime ")
+            thread = [
+                {
+                    "id": "msg-2",
+                    "subject": "Follow-up",
+                    "bodyPreview": "Second",
+                    "isDraft": False,
+                    "conversationId": "conv-1",
+                    "receivedDateTime": "2026-05-13T12:05:00Z",
+                },
+                {
+                    "id": "msg-1",
+                    "subject": "Hello",
+                    "bodyPreview": "First",
+                    "isDraft": False,
+                    "conversationId": "conv-1",
+                    "receivedDateTime": "2026-05-13T12:00:00Z",
+                },
+            ]
+            if request.url.params["$orderby"].endswith(" asc"):
+                thread.reverse()
             return httpx.Response(
                 200,
-                json={
-                    "value": [
-                        {
-                            "id": "msg-2",
-                            "subject": "Follow-up",
-                            "bodyPreview": "Second",
-                            "isDraft": False,
-                            "conversationId": "conv-1",
-                            "receivedDateTime": "2026-05-13T12:05:00Z",
-                        },
-                        {
-                            "id": "msg-1",
-                            "subject": "Hello",
-                            "bodyPreview": "First",
-                            "isDraft": False,
-                            "conversationId": "conv-1",
-                            "receivedDateTime": "2026-05-13T12:00:00Z",
-                        }
-                    ]
-                },
+                json={"value": thread},
             )
 
         if request.url.path.endswith("/outlook/masterCategories") and request.method == "GET":

@@ -216,7 +216,7 @@
     },
     {
       "name": "mail_get_inline_images",
-      "description": "View the pictures embedded in a message body. Returns each inline image as image content, keyed by the contentId that the HTML body references as cid:. Set includeNonInline to also pull regular\u2026"
+      "description": "View the pictures embedded in a message body. Returns each inline image as image content, keyed by the contentId that the HTML body references as cid:. To see where each image sits, read the body\u2026"
     },
     {
       "name": "mail_get_attachment_pdf_pages",
@@ -224,7 +224,7 @@
     },
     {
       "name": "mail_get_thread",
-      "description": "Get message summaries in the same conversation by messageId or conversationId, including sent replies. Returns the newest `top` messages newest first by default; order=\"oldest\" returns the oldest\u2026"
+      "description": "Get message summaries in the same conversation by messageId or conversationId, including sent replies. Returns the newest `top` (max 100) messages newest first by default; order=\"oldest\" returns the\u2026"
     },
     {
       "name": "mail_create_reply_draft",

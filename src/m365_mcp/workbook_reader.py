@@ -5,8 +5,8 @@ cannot open them; the graph client downloads the bytes and this module parses
 them locally with openpyxl in read-only mode. Nothing here touches the network.
 
 The bytes come from arbitrary senders, so the archive is inflated and checked
-before openpyxl sees it (size, compression ratio, and no XML DTDs), and
-openpyxl parses with defusedxml. ``read_workbook`` is synchronous and
+by zip_guard before openpyxl sees it (size, compression ratio, member count,
+and no XML DTDs in UTF-8 or UTF-16), and openpyxl parses with defusedxml. ``read_workbook`` is synchronous and
 CPU-bound; callers run it in a worker thread.
 """
 
@@ -15,8 +15,8 @@ from __future__ import annotations
 import io
 import re
 import warnings
-import zipfile
 from datetime import date, datetime, time, timedelta
+from time import monotonic
 from typing import Any, Callable, NamedTuple
 
 try:  # pragma: no cover - spreadsheet reading degrades to a reason string
@@ -26,6 +26,7 @@ except Exception:  # pragma: no cover
     openpyxl = None  # type: ignore[assignment]
 
 from .models import AttachmentRangeData, WorkbookDefinedNameInfo, WorkbookSheetInfo
+from .zip_guard import NotAZipError, ZipGuardError, check_zip_archive
 
 # openpyxl warns about every Excel feature it does not model (data validation
 # extensions, slicers, ...); none affect values. A process-wide filter rather
@@ -59,6 +60,21 @@ WORKBOOK_MAX_UNCOMPRESSED_BYTES = 150_000_000
 WORKBOOK_MAX_COMPRESSION_RATIO = 100
 WORKBOOK_MAX_ARCHIVE_MEMBERS = 10_000
 MAX_WORKBOOK_DEFINED_NAMES = 500
+EXCEL_MAX_ROWS = 1_048_576
+EXCEL_MAX_COLUMNS = 16_384
+# maxCells bounds the cell count but not the text: one long shared string
+# referenced from thousands of cells is a small file and a huge response.
+# Strings are cut per cell, and text (values, formulas, number formats,
+# defined-name targets) is bounded per call.
+MAX_WORKBOOK_CELL_CHARS = 2_000
+MAX_WORKBOOK_TOTAL_CHARS = 200_000
+WORKBOOK_TEXT_CUT_MARKER = "…"
+MAX_WORKBOOK_RANGES = 20
+# Measuring a sheet's used range reads every stored cell. A crafted sheet can
+# hold millions, so the scan stops after this many cells or seconds and the
+# extent is reported as incomplete.
+WORKBOOK_EXTENT_MAX_CELLS = 5_000_000
+WORKBOOK_EXTENT_MAX_SECONDS = 10.0
 WORKBOOK_ERROR_VALUE = re.compile(r"#(?:N/A|REF!|NAME\?|VALUE!|DIV/0!|NULL!|NUM!)")
 # A bracketed workbook before a sheet reference ([1]Proforma!C4); structured
 # table references like Table1[Rent] have no "!" and are kept.
@@ -70,6 +86,27 @@ Bounds = tuple[int, int, int, int]
 class WorkbookReadError(RuntimeError):
     """Raised when a spreadsheet or one of its ranges cannot be read; surfaced
     as ``unsupportedReason`` or a per-range ``error``."""
+
+
+class _TextBudget:
+    """Characters of text one call may still return."""
+
+    def __init__(self, total: int) -> None:
+        self.remaining = total
+        self.cut_cells = 0
+
+    def take(self, value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        if len(value) > MAX_WORKBOOK_CELL_CHARS:
+            value = value[:MAX_WORKBOOK_CELL_CHARS] + WORKBOOK_TEXT_CUT_MARKER
+            self.cut_cells += 1
+        self.remaining -= len(value)
+        return value
+
+    @property
+    def exhausted(self) -> bool:
+        return self.remaining < 0
 
 
 class WorkbookRead(NamedTuple):
@@ -194,10 +231,13 @@ def _read(
     # the whole sheet, so it only happens for sheets the layout or a
     # whole-row/column request actually needs.
     extents: dict[str, Bounds | None] = {}
+    incomplete_extents: set[str] = set()
 
     def extent_of(title: str) -> Bounds | None:
         if title not in extents:
-            extents[title] = _worksheet_extent(books.formulas[title])
+            extents[title], complete = _worksheet_extent(books.formulas[title])
+            if not complete:
+                incomplete_extents.add(title)
         return extents[title]
 
     book = books.values
@@ -206,12 +246,15 @@ def _read(
     name_count: int | None = None
     names_skipped: int | None = None
     truncated = False
+    budget = _TextBudget(MAX_WORKBOOK_TOTAL_CHARS)
     if includeLayout or includeDefinedNames:
         usable_names, names_skipped = _workbook_defined_names(book)
         name_count = len(usable_names)
         if includeDefinedNames:
             truncated = name_count > MAX_WORKBOOK_DEFINED_NAMES
             defined_names = usable_names[:MAX_WORKBOOK_DEFINED_NAMES]
+            for defined_name in defined_names:
+                defined_name.value = budget.take(defined_name.value)
     if includeLayout:
         for worksheet in book.worksheets:
             extent = extent_of(worksheet.title)
@@ -222,6 +265,7 @@ def _read(
                     dimensions=_a1_address(*extent) if extent else None,
                     rowCount=extent[3] - extent[1] + 1 if extent else 0,
                     columnCount=extent[2] - extent[0] + 1 if extent else 0,
+                    extentIncomplete=worksheet.title in incomplete_extents,
                 )
             )
 
@@ -239,10 +283,12 @@ def _read(
                 request,
                 default_sheet=sheet,
                 extent_of=extent_of,
+                incomplete_extents=incomplete_extents,
                 includeFormulas=includeFormulas,
                 includeNumberFormat=includeNumberFormat,
                 remaining=remaining,
                 maxCells=maxCells,
+                budget=budget,
             )
         except Exception as error:
             # One unreadable range never costs the caller the others.
@@ -277,17 +323,22 @@ def _read_range(
     *,
     default_sheet: str | None,
     extent_of: Callable[[str], Bounds | None],
+    incomplete_extents: set[str],
     includeFormulas: bool,
     includeNumberFormat: bool,
     remaining: int,
     maxCells: int,
+    budget: _TextBudget,
 ) -> tuple[AttachmentRangeData, int]:
-    """Read one range within the remaining cell budget; return it and the
-    number of cells it used."""
+    """Read one range within the remaining cell and text budgets; return it
+    and the number of cells it used."""
 
-    worksheet_name, bounds = _resolve_range(
+    worksheet_name, bounds, used_extent = _resolve_range(
         books.values, request, default_sheet=default_sheet, extent_of=extent_of
     )
+    # A whole-sheet/row/column request on a sheet whose scan stopped early
+    # may be missing cells past the measured extent.
+    extent_cut = used_extent and worksheet_name in incomplete_extents
     if bounds is None:
         return (
             AttachmentRangeData(
@@ -296,6 +347,18 @@ def _read_range(
                 values=[],
                 rowCount=0,
                 columnCount=0,
+                truncated=extent_cut,
+            ),
+            0,
+        )
+
+    def used_up(limit: str) -> tuple[AttachmentRangeData, int]:
+        return (
+            AttachmentRangeData(
+                worksheet=worksheet_name,
+                address=_a1_address(*bounds),
+                truncated=True,
+                error=f"{limit} is used up; request this range in another call",
             ),
             0,
         )
@@ -303,54 +366,71 @@ def _read_range(
     min_col, min_row, max_col, max_row = bounds
     column_count = max_col - min_col + 1
     row_count = max_row - min_row + 1
-    range_truncated = False
+    range_truncated = extent_cut
     if row_count * column_count > remaining:
         allowed_rows = remaining // column_count
         if allowed_rows == 0:
-            return (
-                AttachmentRangeData(
-                    worksheet=worksheet_name,
-                    address=_a1_address(*bounds),
-                    truncated=True,
-                    error=(
-                        f"maxCells={maxCells} is used up; request this "
-                        "range in another call"
-                    ),
-                ),
-                0,
-            )
-        max_row = min_row + allowed_rows - 1
+            return used_up(f"maxCells={maxCells}")
         row_count = allowed_rows
         range_truncated = True
+    if budget.remaining <= 0:
+        return used_up(f"The {MAX_WORKBOOK_TOTAL_CHARS}-character text limit")
 
-    def grid(book: Any, read: Callable[[Any], Any]) -> list[list[Any]]:
+    def grid(book: Any, read: Callable[[Any], Any], rows_wanted: int) -> list[list[Any]]:
+        """Read up to ``rows_wanted`` rows, stopping before the row that
+        exhausts the text budget."""
+        rows: list[list[Any]] = []
+        for row in book[worksheet_name].iter_rows(
+            min_row=min_row,
+            max_row=min_row + rows_wanted - 1,
+            min_col=min_col,
+            max_col=max_col,
+        ):
+            if len(rows) == rows_wanted:
+                break
+            cells = [budget.take(read(cell)) for cell in row][:column_count]
+            if budget.exhausted:
+                return rows
+            cells.extend([None] * (column_count - len(cells)))
+            rows.append(cells)
         # Read-only worksheets stop at their last stored row, so pad to the
         # requested shape; rowCount and the address always match the values.
-        rows = [
-            [read(cell) for cell in row][:column_count]
-            for row in book[worksheet_name].iter_rows(
-                min_row=min_row, max_row=max_row, min_col=min_col, max_col=max_col
-            )
-        ][:row_count]
-        for row in rows:
-            row.extend([None] * (column_count - len(row)))
-        rows.extend([None] * column_count for _ in range(row_count - len(rows)))
+        rows.extend([None] * column_count for _ in range(rows_wanted - len(rows)))
         return rows
 
     def value(cell: Any) -> Any:
         return _cell_value(cell.value)
 
+    cut_before = budget.cut_cells
+    grids: list[list[list[Any]]] = []
+    readers: list[tuple[Any, Callable[[Any], Any]]] = [(books.values, value)]
+    if includeFormulas:
+        readers.append((books.formulas, value))
+    if includeNumberFormat:
+        readers.append((books.values, lambda cell: getattr(cell, "number_format", None)))
+    for book, read in readers:
+        rows = grid(book, read, row_count)
+        if len(rows) < row_count:
+            # The text budget ran out; keep every grid the same height.
+            row_count = len(rows)
+            range_truncated = True
+            grids = [earlier[:row_count] for earlier in grids]
+        grids.append(rows)
+        if row_count == 0:
+            return used_up(f"The {MAX_WORKBOOK_TOTAL_CHARS}-character text limit")
+    values, *rest = grids
+    formulas = rest.pop(0) if includeFormulas else None
+    number_format = rest.pop(0) if includeNumberFormat else None
+    # A cell whose text was cut also marks the range truncated.
+    range_truncated = range_truncated or budget.cut_cells > cut_before
+
     return (
         AttachmentRangeData(
             worksheet=worksheet_name,
-            address=_a1_address(min_col, min_row, max_col, max_row),
-            values=grid(books.values, value),
-            formulas=grid(books.formulas, value) if includeFormulas else None,
-            numberFormat=(
-                grid(books.values, lambda cell: getattr(cell, "number_format", None))
-                if includeNumberFormat
-                else None
-            ),
+            address=_a1_address(min_col, min_row, max_col, min_row + row_count - 1),
+            values=values,
+            formulas=formulas,
+            numberFormat=number_format,
             rowCount=row_count,
             columnCount=column_count,
             truncated=range_truncated,
@@ -360,56 +440,21 @@ def _read_range(
 
 
 def _check_archive(content_bytes: bytes) -> None:
-    unreadable = (
-        "Attachment is not a readable .xlsx workbook; it may be "
-        "password-protected or a legacy .xls file with an .xlsx name"
-    )
     try:
-        archive = zipfile.ZipFile(io.BytesIO(content_bytes))
-    except zipfile.BadZipFile as error:
-        raise WorkbookReadError(unreadable) from error
-
-    limit = min(
-        WORKBOOK_MAX_UNCOMPRESSED_BYTES,
-        max(len(content_bytes), 1) * WORKBOOK_MAX_COMPRESSION_RATIO,
-    )
-    too_large = WorkbookReadError(
-        f"Workbook expands to more than {limit} bytes and was not opened"
-    )
-    with archive:
-        members = archive.infolist()
-        if len(members) > WORKBOOK_MAX_ARCHIVE_MEMBERS:
-            raise WorkbookReadError(
-                f"Workbook archive has more than {WORKBOOK_MAX_ARCHIVE_MEMBERS} "
-                "parts and was not opened"
-            )
-        if sum(info.file_size for info in members) > limit:
-            raise too_large
-        inflated = 0
-        for info in members:
-            if info.is_dir():
-                continue
-            try:
-                with archive.open(info) as member:
-                    tail = b""
-                    while chunk := member.read(1 << 20):
-                        inflated += len(chunk)
-                        if inflated > limit:
-                            raise too_large
-                        # Entity-expansion attacks need a DTD, and Excel never
-                        # writes one, so a workbook carrying one is refused
-                        # whichever XML parser openpyxl ends up using.
-                        if b"<!DOCTYPE" in tail + chunk:
-                            raise WorkbookReadError(
-                                "Workbook contains an XML document type "
-                                "declaration, which Excel never writes; it "
-                                "was not opened"
-                            )
-                        tail = chunk[-8:]
-            except WorkbookReadError:
-                raise
-            except Exception as error:
-                raise WorkbookReadError(f"Workbook archive is damaged: {error}") from error
+        check_zip_archive(
+            content_bytes,
+            max_inflated_bytes=WORKBOOK_MAX_UNCOMPRESSED_BYTES,
+            max_ratio=WORKBOOK_MAX_COMPRESSION_RATIO,
+            max_members=WORKBOOK_MAX_ARCHIVE_MEMBERS,
+            label="Workbook",
+        )
+    except NotAZipError as error:
+        raise WorkbookReadError(
+            "Attachment is not a readable .xlsx workbook; it may be "
+            "password-protected or a legacy .xls file with an .xlsx name"
+        ) from error
+    except ZipGuardError as error:
+        raise WorkbookReadError(str(error)) from error
 
 
 def _open(content_bytes: bytes, *, data_only: bool) -> Any:
@@ -424,14 +469,22 @@ def _open(content_bytes: bytes, *, data_only: bool) -> Any:
         raise WorkbookReadError(f"Could not open workbook: {error}") from error
 
 
-def _worksheet_extent(worksheet: Any) -> Bounds | None:
-    """Return ``(min_col, min_row, max_col, max_row)`` of non-empty cells."""
+def _worksheet_extent(worksheet: Any) -> tuple[Bounds | None, bool]:
+    """Return ``(min_col, min_row, max_col, max_row)`` of non-empty cells and
+    whether the whole sheet was scanned (see WORKBOOK_EXTENT_MAX_*)."""
 
     worksheet.reset_dimensions()
     min_col = min_row = max_col = max_row = None
+    deadline = monotonic() + WORKBOOK_EXTENT_MAX_SECONDS
+    scanned = 0
+    complete = True
     for row_index, row in enumerate(
         worksheet.iter_rows(min_row=1, values_only=True), start=1
     ):
+        scanned += len(row)
+        if scanned > WORKBOOK_EXTENT_MAX_CELLS or monotonic() > deadline:
+            complete = False
+            break
         for column_index, value in enumerate(row, start=1):
             if value is None or value == "":
                 continue
@@ -443,8 +496,8 @@ def _worksheet_extent(worksheet: Any) -> Bounds | None:
             if max_col is None or column_index > max_col:
                 max_col = column_index
     if min_row is None:
-        return None
-    return min_col, min_row, max_col, max_row
+        return None, complete
+    return (min_col, min_row, max_col, max_row), complete
 
 
 def _workbook_defined_names(book: Any) -> tuple[list[WorkbookDefinedNameInfo], int]:
@@ -498,11 +551,12 @@ def _resolve_range(
     *,
     default_sheet: str | None,
     extent_of: Callable[[str], Bounds | None],
-) -> tuple[str, Bounds | None]:
+) -> tuple[str, Bounds | None, bool]:
     """Turn an A1 address, ``Sheet!A1:B2``, a defined name, or ``Sheet!Name``
     into a sheet and ``(min_col, min_row, max_col, max_row)`` bounds. Whole
     rows or columns are clamped to the sheet's used range; ``None`` bounds
-    mean the request covers no used cells."""
+    mean the request covers no used cells. The flag is true when the bounds
+    came from the measured used range."""
 
     sheet_name: str | None = None
     address: str | None = None
@@ -522,7 +576,7 @@ def _resolve_range(
 
     worksheet_name = _match_worksheet(book, sheet_name or default_sheet)
     if not address:
-        return worksheet_name, extent_of(worksheet_name)
+        return worksheet_name, extent_of(worksheet_name), True
 
     try:
         min_col, min_row, max_col, max_row = range_boundaries(address)
@@ -530,15 +584,25 @@ def _resolve_range(
         raise WorkbookReadError(
             f"'{request}' is not an A1 address or defined name"
         ) from error
-    if None in (min_col, min_row, max_col, max_row):
+    used_extent = None in (min_col, min_row, max_col, max_row)
+    if used_extent:
         extent = extent_of(worksheet_name)
         if extent is None:
-            return worksheet_name, None
+            return worksheet_name, None, True
         min_col = min_col or extent[0]
         min_row = min_row or extent[1]
         max_col = max_col or extent[2]
         max_row = max_row or extent[3]
-    return worksheet_name, (min_col, min_row, max_col, max_row)
+    # Excel reads A10001:A1 as A1:A10001. Normalising here also keeps every
+    # cell count positive, so a reversed range can never add to the budget.
+    min_col, max_col = sorted((min_col, max_col))
+    min_row, max_row = sorted((min_row, max_row))
+    if max_row > EXCEL_MAX_ROWS or max_col > EXCEL_MAX_COLUMNS:
+        raise WorkbookReadError(
+            f"'{request}' is outside a worksheet ({EXCEL_MAX_ROWS} rows, "
+            f"{EXCEL_MAX_COLUMNS} columns)"
+        )
+    return worksheet_name, (min_col, min_row, max_col, max_row), used_extent
 
 
 def _match_worksheet(book: Any, sheet_name: str | None) -> str:

@@ -297,6 +297,9 @@ class WorkbookSheetInfo(AppModel):
     dimensions: str | None = None
     rowCount: int = 0
     columnCount: int = 0
+    # True when measuring stopped early on a very large sheet, so the used
+    # range may extend past ``dimensions``.
+    extentIncomplete: bool = False
 
 
 class WorkbookDefinedNameInfo(AppModel):

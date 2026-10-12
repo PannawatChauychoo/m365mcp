@@ -2220,3 +2220,173 @@ async def test_workbook_attachment_refuses_dtds_and_zip_bombs() -> None:
     result = await graph.get_attachment_workbook(messageId="msg-1", attachmentId="xl-1")
     assert "expands to more than" in result.unsupportedReason
     await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_workbook_attachment_reversed_ranges_cannot_raise_the_cell_budget() -> None:
+    # Review repro: a reversed range gave a negative cell count, which raised
+    # the remaining budget for the ranges after it.
+    def build(workbook) -> None:
+        sheet = workbook.active
+        for row in range(1, 101):
+            sheet.cell(row=row, column=1, value=row)
+
+    client, graph = _workbook_graph(_xlsx_bytes(build))
+
+    result = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", ranges=["A101:A1", "A1:A100"], maxCells=2
+    )
+    reversed_range, after = result.ranges
+    # Read like Excel does, as A1:A101, within the 2-cell budget.
+    assert (reversed_range.address, reversed_range.rowCount) == ("A1:A2", 2)
+    assert reversed_range.values == [[1], [2]]
+    assert reversed_range.truncated is True
+    assert after.values is None
+    assert "maxCells=2 is used up" in after.error
+
+    flipped = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", ranges=["B3:A1"]
+    )
+    assert flipped.ranges[0].address == "A1:B3"
+    assert flipped.ranges[0].values == [[1, None], [2, None], [3, None]]
+
+    outside = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", ranges=["A1:A1048577", "XFE1", "A1"]
+    )
+    assert "outside a worksheet" in outside.ranges[0].error
+    assert outside.ranges[1].error is not None
+    assert outside.ranges[2].values == [[1]]
+
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_workbook_attachment_bounds_text_per_cell_and_per_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from m365_mcp import workbook_reader
+    from m365_mcp.workbook_reader import MAX_WORKBOOK_CELL_CHARS, WORKBOOK_TEXT_CUT_MARKER
+
+    # Scaled down so the test workbook stays under the compression-ratio
+    # limit; the per-cell cap is the real one.
+    total_chars = 10_000
+    monkeypatch.setattr(workbook_reader, "MAX_WORKBOOK_TOTAL_CHARS", total_chars)
+    long_text = "x" * (MAX_WORKBOOK_CELL_CHARS * 3)
+
+    def build(workbook) -> None:
+        sheet = workbook.active
+        for row in range(1, 31):
+            sheet.cell(row=row, column=1, value=long_text)
+            sheet.cell(row=row, column=2, value=row)
+
+    client, graph = _workbook_graph(_xlsx_bytes(build))
+
+    result = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", ranges=["A1:B30", "B1"]
+    )
+    cut, after = result.ranges
+    assert cut.values[0][0] == "x" * MAX_WORKBOOK_CELL_CHARS + WORKBOOK_TEXT_CUT_MARKER
+    assert cut.values[0][1] == 1
+    # Whole rows only, up to the per-call limit; the address matches.
+    kept = total_chars // (MAX_WORKBOOK_CELL_CHARS + 1)
+    assert cut.rowCount == len(cut.values) == kept
+    assert cut.address == f"A1:B{kept}"
+    assert cut.truncated is True and result.truncated is True
+    assert "character text limit is used up" in after.error
+
+    # One cut cell is enough to flag the range.
+    single = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", ranges=["A1"]
+    )
+    assert single.ranges[0].truncated is True
+
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_workbook_attachment_text_limit_keeps_grids_the_same_height(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from m365_mcp import workbook_reader
+
+    monkeypatch.setattr(workbook_reader, "MAX_WORKBOOK_TOTAL_CHARS", 60)
+
+    def build(workbook) -> None:
+        sheet = workbook.active
+        for row in range(1, 6):
+            sheet.cell(row=row, column=1, value=f"=CONCAT(\"row\",{row})")
+
+    client, graph = _workbook_graph(_xlsx_bytes(build))
+    result = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", ranges=["A1:A5"], includeFormulas=True
+    )
+    (read,) = result.ranges
+    # Values are uncalculated (null), so the formula text is what runs out.
+    assert 0 < read.rowCount < 5
+    assert len(read.values) == len(read.formulas) == read.rowCount
+    assert read.truncated is True
+
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_workbook_attachment_caps_ranges_per_call() -> None:
+    from m365_mcp.workbook_reader import MAX_WORKBOOK_RANGES
+
+    downloads: list[int] = []
+    client, graph = _workbook_graph(_xlsx_bytes(_build_deal_model), downloads=downloads)
+    with pytest.raises(ValueError, match=f"at most {MAX_WORKBOOK_RANGES}"):
+        await graph.get_attachment_workbook(
+            messageId="msg-1",
+            attachmentId="xl-1",
+            ranges=["'Unit Mix'!C2"] * (MAX_WORKBOOK_RANGES + 1),
+        )
+    assert downloads == []
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_workbook_attachment_extent_scan_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from m365_mcp import workbook_reader
+
+    monkeypatch.setattr(workbook_reader, "WORKBOOK_EXTENT_MAX_CELLS", 5)
+
+    def build(workbook) -> None:
+        sheet = workbook.active
+        sheet.title = "Big"
+        for row in range(1, 11):
+            sheet.cell(row=row, column=1, value=row)
+
+    client, graph = _workbook_graph(_xlsx_bytes(build))
+
+    layout = await graph.get_attachment_workbook(messageId="msg-1", attachmentId="xl-1")
+    (sheet,) = layout.sheets
+    assert sheet.extentIncomplete is True
+    assert sheet.dimensions == "A1:A5"
+
+    whole = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", sheet="Big"
+    )
+    assert whole.ranges[0].truncated is True
+    # An explicit address does not depend on the scan.
+    explicit = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", ranges=["A1:A10"]
+    )
+    assert explicit.ranges[0].truncated is False
+    assert explicit.ranges[0].values[-1] == [10]
+
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_workbook_attachment_refuses_utf16_dtd() -> None:
+    base = _xlsx_bytes(_build_deal_model)
+    xml = '<?xml version="1.0" encoding="UTF-16"?><!DOCTYPE worksheet><worksheet/>'
+    client, graph = _workbook_graph(
+        _rezip(base, {"xl/worksheets/sheet1.xml": xml.encode("utf-16")})
+    )
+    result = await graph.get_attachment_workbook(messageId="msg-1", attachmentId="xl-1")
+    assert "document type declaration" in result.unsupportedReason
+    await client.aclose()

@@ -1085,6 +1085,11 @@ class MicrosoftGraphClient:
         are clamped to the module ceilings.
         """
 
+        if ranges and len(ranges) > workbook_reader.MAX_WORKBOOK_RANGES:
+            raise ValueError(
+                f"ranges takes at most {workbook_reader.MAX_WORKBOOK_RANGES} "
+                f"entries per call; got {len(ranges)}"
+            )
         normalized_mailbox = self._normalize_mailbox(mailbox)
         base = self._base_path(normalized_mailbox)
         maxBytes = workbook_reader.clamp_max_bytes(maxBytes)

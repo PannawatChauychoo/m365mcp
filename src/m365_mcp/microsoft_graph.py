@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import base64
 import io
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import httpx
 
@@ -114,6 +115,14 @@ CONTACT_EXTENDED_PROPERTIES_EXPAND = (
     f"'{PERSONAL_HOME_PAGE_EXTENDED_PROPERTY_ID}')"
 )
 CONTACT_FOLDER_SELECT = "id,displayName,parentFolderId"
+# YYYY-MM-DD, optionally followed by a time and a Z or +HH:MM/+HHMM/+HH offset.
+_ISO_DATETIME_RE = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})"
+    r"(?:[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:[.,](\d{1,9}))?)?)?"
+    r"(Z|z|[+-]\d{2}(?::?\d{2})?)?"
+)
+# Graph continuation parameters carried in a mail_list cursor.
+_MAIL_LIST_CURSOR_KEYS = {"$skip", "$skiptoken"}
 
 
 def _build_contact_read_query(*, top: int | None = None) -> str:
@@ -245,16 +254,17 @@ class MicrosoftGraphClient:
         receivedAfter: str | None = None,
         receivedBefore: str | None = None,
         order: str = "newest",
-        skip: int = 0,
+        cursor: str | None = None,
     ) -> MailListResult:
         if order not in ("newest", "oldest"):
             raise ValueError('order must be "newest" or "oldest"')
-        if skip < 0:
-            raise ValueError("skip must be 0 or greater")
-        received_after = self._graph_datetime(receivedAfter, "receivedAfter")
-        received_before = self._graph_datetime(receivedBefore, "receivedBefore")
-        if received_after and received_before and received_after >= received_before:
+        page_params = self._mail_list_cursor_params(cursor)
+        after = self._graph_datetime(receivedAfter, "receivedAfter")
+        before = self._graph_datetime(receivedBefore, "receivedBefore")
+        if after and before and after[1] >= before[1]:
             raise ValueError("receivedAfter must be earlier than receivedBefore")
+        received_after = after[0] if after else None
+        received_before = before[0] if before else None
         normalized_mailbox = self._normalize_mailbox(mailbox)
         base = self._base_path(normalized_mailbox)
         resolved_folder_id = folderId
@@ -294,15 +304,14 @@ class MicrosoftGraphClient:
         }
         if filters:
             params["$filter"] = " and ".join(filters)
-        if skip:
-            params["$skip"] = str(skip)
+        params.update(page_params)
         query = httpx.QueryParams(params)
         result = await self._request(
             f"{self._mail_folder_messages_path(base, legacy_folder, resolved_folder_id)}?{query}"
         )
 
         messages = [self._map_message_summary(message) for message in result["value"]]
-        has_more = bool(result.get("@odata.nextLink"))
+        next_link = result.get("@odata.nextLink")
         return MailListResult(
             mailbox=normalized_mailbox or "me",
             folder=folder,
@@ -311,9 +320,8 @@ class MicrosoftGraphClient:
             order=order,
             receivedAfter=received_after,
             receivedBefore=received_before,
-            skip=skip,
-            hasMore=has_more,
-            nextSkip=skip + len(messages) if has_more else None,
+            hasMore=bool(next_link),
+            nextCursor=self._mail_list_next_cursor(next_link),
             messages=messages,
         )
 
@@ -2261,25 +2269,97 @@ class MicrosoftGraphClient:
         return filters
 
     @staticmethod
-    def _graph_datetime(value: str | None, name: str) -> str | None:
+    def _graph_datetime(
+        value: str | None, name: str
+    ) -> tuple[str, tuple[datetime, int]] | None:
         """Normalize an ISO 8601 date or date-time to a UTC OData literal.
 
-        A value without an offset (including a bare date) is read as UTC."""
+        Returns the literal and a sort key. A value without an offset
+        (including a bare date) is read as UTC. Parsed by hand rather than
+        with datetime.fromisoformat, which accepts different formats on
+        Python 3.10 and 3.11+, and so fractional seconds of any precision
+        survive unchanged."""
         text = (value or "").strip()
         if not text:
             return None
+        invalid = ValueError(
+            f"{name} must be an ISO 8601 date or date-time, such as "
+            f"2026-10-01 or 2026-10-01T09:00:00-05:00; got {value!r}"
+        )
+        match = _ISO_DATETIME_RE.fullmatch(text)
+        if not match:
+            raise invalid
+        year, month, day, hour, minute, second, fraction, zone = match.groups()
+        if int(year) < 1900:
+            raise ValueError(f"{name} must be in 1900 or later; got {value!r}")
+        offset = timedelta(0)
+        if zone and zone not in "Zz":
+            sign = -1 if zone[0] == "-" else 1
+            digits = zone[1:].replace(":", "")
+            offset = sign * timedelta(hours=int(digits[:2]), minutes=int(digits[2:] or 0))
         try:
-            parsed = datetime.fromisoformat(
-                text[:-1] + "+00:00" if text[-1] in "Zz" else text
+            parsed = datetime(
+                int(year),
+                int(month),
+                int(day),
+                int(hour or 0),
+                int(minute or 0),
+                int(second or 0),
+                tzinfo=timezone(offset),
+            ).astimezone(timezone.utc)
+        except (ValueError, OverflowError) as exc:
+            raise invalid from exc
+        literal = parsed.strftime("%Y-%m-%dT%H:%M:%S")
+        if fraction:
+            literal += f".{fraction}"
+        return f"{literal}Z", (parsed, int((fraction or "").ljust(9, "0")))
+
+    @staticmethod
+    def _mail_list_next_cursor(next_link: str | None) -> str | None:
+        """Turn Graph's @odata.nextLink into an opaque mail_list cursor.
+
+        With a $filter, Graph's continuation $skip counts mailbox items
+        scanned rather than messages returned, so only Graph's own value pages
+        correctly. Only the continuation parameters are kept; the next call
+        rebuilds the request from its own arguments, so the link itself is
+        never followed and the token never leaves graph.microsoft.com."""
+        if not next_link:
+            return None
+        parts = urlsplit(next_link)
+        if parts.scheme != "https" or parts.hostname != "graph.microsoft.com":
+            return None
+        continuation = [
+            (key, value)
+            for key, value in parse_qsl(parts.query)
+            if key in _MAIL_LIST_CURSOR_KEYS
+        ]
+        if not continuation:
+            return None
+        return base64.urlsafe_b64encode(urlencode(continuation).encode()).decode()
+
+    @staticmethod
+    def _mail_list_cursor_params(cursor: str | None) -> dict[str, str]:
+        if not cursor:
+            return {}
+        invalid = ValueError(
+            "cursor must be a nextCursor value returned by mail_list"
+        )
+        try:
+            pairs = parse_qsl(
+                base64.urlsafe_b64decode(cursor.encode()).decode(),
+                strict_parsing=True,
             )
         except ValueError as exc:
-            raise ValueError(
-                f"{name} must be an ISO 8601 date or date-time, such as "
-                f"2026-10-01 or 2026-10-01T09:00:00-05:00; got {value!r}"
-            ) from exc
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            raise invalid from exc
+        params = dict(pairs)
+        if (
+            not pairs
+            or len(params) != len(pairs)
+            or not set(params) <= _MAIL_LIST_CURSOR_KEYS
+            or not params.get("$skip", "0").isdigit()
+        ):
+            raise invalid
+        return params
 
     def _escape_odata_string(self, value: str) -> str:
         return value.replace("'", "''")

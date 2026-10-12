@@ -444,9 +444,9 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
             "receivedBefore (exclusive) take ISO 8601 dates or date-times, read "
             "as UTC unless an offset is given, and combine with the other "
             "filters, including inferenceClassification for Focused/Other. "
-            "When hasMore is true, call again with skip=nextSkip for the next "
-            "page. Use mailbox for shared/delegated mailboxes the signed-in "
-            "Microsoft user can access."
+            "When hasMore is true, call again with the same arguments and "
+            "cursor=nextCursor for the next page. Use mailbox for "
+            "shared/delegated mailboxes the signed-in Microsoft user can access."
         ),
     )
     async def mail_list(
@@ -464,7 +464,7 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
         receivedAfter: str | None = None,
         receivedBefore: str | None = None,
         order: Literal["newest", "oldest"] = "newest",
-        skip: int = 0,
+        cursor: str | None = None,
     ) -> MailListResult:
         runtime = runtime_provider.get()
         return await runtime.graph.list_messages(
@@ -482,14 +482,14 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
             receivedAfter=receivedAfter,
             receivedBefore=receivedBefore,
             order=order,
-            skip=skip,
+            cursor=cursor,
         )
 
     @mcp.tool(
         name="mail_check_inbox",
         description=(
             "Quickly check an inbox or shared inbox folder. Defaults to unread "
-            "messages in Inbox and includes triage metadata."
+            "messages in Inbox, newest first, and includes triage metadata."
         ),
     )
     async def mail_check_inbox(

@@ -94,8 +94,11 @@ async def test_list_messages_filters_by_date_sorts_and_pages() -> None:
             ]
         }
         if skip == 0:
+            # With a filter, Graph's continuation $skip counts items scanned,
+            # not messages returned, so it differs from len(value).
             body["@odata.nextLink"] = (
-                "https://graph.microsoft.com/v1.0/me/mailFolders('Inbox')/messages?$skip=2"
+                "https://graph.microsoft.com/v1.0/me/mailFolders('Inbox')/messages"
+                "?$top=2&$filter=x&$skip=7"
             )
         return httpx.Response(200, json=body)
 
@@ -120,18 +123,29 @@ async def test_list_messages_filters_by_date_sorts_and_pages() -> None:
     assert first.receivedAfter == "2026-10-01T00:00:00Z"
     assert first.receivedBefore == "2026-10-07T14:00:00Z"
     assert first.hasMore is True
-    assert first.nextSkip == 2
+    assert first.nextCursor
 
-    second = await graph.list_messages(top=2, order="oldest", skip=first.nextSkip)
+    second = await graph.list_messages(
+        top=2,
+        inferenceClassification="focused",
+        receivedAfter="2026-10-01",
+        receivedBefore="2026-10-07T09:00:00-05:00",
+        cursor=first.nextCursor,
+    )
+    params = requests[-1].url.params
+    # Graph's own continuation, not skip + len(messages); the filter comes
+    # from the arguments, not from the link.
+    assert params["$skip"] == "7"
+    assert params["$filter"].startswith("receivedDateTime ge 2026-10-01T00:00:00Z")
+    assert [message.id for message in second.messages] == ["m7", "m8"]
+    assert second.hasMore is False
+    assert second.nextCursor is None
+
+    await graph.list_messages(top=2, order="oldest")
     params = requests[-1].url.params
     assert params["$orderby"] == "receivedDateTime asc"
-    assert params["$skip"] == "2"
     # No filters at all: plain $orderby needs no date bound.
     assert "$filter" not in params
-    assert [message.id for message in second.messages] == ["m2", "m3"]
-    assert second.order == "oldest"
-    assert second.hasMore is False
-    assert second.nextSkip is None
 
     await graph.list_messages(receivedBefore="2026-10-07Z")
     assert requests[-1].url.params["$filter"] == (
@@ -145,10 +159,83 @@ async def test_list_messages_filters_by_date_sorts_and_pages() -> None:
         await graph.list_messages(receivedAfter="2026-10-07", receivedBefore="2026-10-01")
     with pytest.raises(ValueError, match="order"):
         await graph.list_messages(order="latest")
-    with pytest.raises(ValueError, match="skip"):
-        await graph.list_messages(skip=-1)
+    for bad_cursor in ("not-a-cursor", base64.urlsafe_b64encode(b"$filter=x").decode()):
+        with pytest.raises(ValueError, match="cursor"):
+            await graph.list_messages(cursor=bad_cursor)
 
     await client.aclose()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2026-10-01", "2026-10-01T00:00:00Z"),
+        ("2026-10-07Z", "2026-10-07T00:00:00Z"),
+        ("2026-10-01T12:00:00.500Z", "2026-10-01T12:00:00.500Z"),
+        ("2026-10-01T12:00:00.9Z", "2026-10-01T12:00:00.9Z"),
+        ("2026-10-01T12:00:00.1234567Z", "2026-10-01T12:00:00.1234567Z"),
+        ("2026-10-01T09:00:00.25-05:00", "2026-10-01T14:00:00.25Z"),
+        # Formats datetime.fromisoformat only accepts on Python 3.11+.
+        ("2026-10-01T09:00-0500", "2026-10-01T14:00:00Z"),
+        ("2026-10-01T09:00:00+05", "2026-10-01T04:00:00Z"),
+        ("2026-10-01 09:00:00,5", "2026-10-01T09:00:00.5Z"),
+        ("2026-10-01T23:30:00-01:00", "2026-10-02T00:30:00Z"),
+    ],
+)
+def test_graph_datetime_normalizes_to_utc(value: str, expected: str) -> None:
+    result = MicrosoftGraphClient._graph_datetime(value, "receivedAfter")
+    assert result is not None
+    assert result[0] == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("last week", "ISO 8601"),
+        ("20261001", "ISO 8601"),
+        ("2026-13-01", "ISO 8601"),
+        ("2026-10-01T25:00:00Z", "ISO 8601"),
+        ("2026-10-01T09:00:00+24:00", "ISO 8601"),
+        ("9999-12-31T23:00:00-05:00", "ISO 8601"),
+        ("0999-01-01", "1900 or later"),
+        ("1899-12-31", "1900 or later"),
+    ],
+)
+def test_graph_datetime_rejects_invalid_values(value: str, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        MicrosoftGraphClient._graph_datetime(value, "receivedAfter")
+
+
+@pytest.mark.anyio
+async def test_list_messages_compares_fractional_bounds_numerically() -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"value": []}))
+    )
+    graph = MicrosoftGraphClient(StaticAuthService(), client)
+    # As strings ".5Z" sorts before "Z"; as times, .5 s is later.
+    result = await graph.list_messages(
+        receivedAfter="2026-10-01T12:00:00Z",
+        receivedBefore="2026-10-01T12:00:00.5Z",
+    )
+    assert result.receivedBefore == "2026-10-01T12:00:00.5Z"
+    with pytest.raises(ValueError, match="earlier than"):
+        await graph.list_messages(
+            receivedAfter="2026-10-01T12:00:00.5Z",
+            receivedBefore="2026-10-01T12:00:00Z",
+        )
+    await client.aclose()
+
+
+def test_mail_list_cursor_only_from_graph_links() -> None:
+    next_cursor = MicrosoftGraphClient._mail_list_next_cursor
+    assert next_cursor(None) is None
+    assert next_cursor("https://example.com/v1.0/me/messages?$skip=7") is None
+    assert next_cursor("http://graph.microsoft.com/v1.0/me/messages?$skip=7") is None
+    assert next_cursor("https://graph.microsoft.com/v1.0/me/messages?$top=5") is None
+    cursor = next_cursor(
+        "https://graph.microsoft.com/v1.0/me/messages?$top=5&$skiptoken=abc%3D"
+    )
+    assert MicrosoftGraphClient._mail_list_cursor_params(cursor) == {"$skiptoken": "abc="}
 
 
 @pytest.mark.anyio

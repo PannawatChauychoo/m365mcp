@@ -112,10 +112,9 @@ class MailListResult(AppModel):
     order: Literal["newest", "oldest"] = "newest"
     receivedAfter: str | None = None
     receivedBefore: str | None = None
-    skip: int = 0
     hasMore: bool = False
-    # Pass as `skip` to read the next page; None when there is no next page.
-    nextSkip: int | None = None
+    # Pass as `cursor`, with the same other arguments, to read the next page.
+    nextCursor: str | None = None
     messages: list[MessageSummary]
 
 

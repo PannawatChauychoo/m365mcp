@@ -128,7 +128,7 @@
     },
     {
       "name": "mail_check_inbox",
-      "description": "Quickly check an inbox or shared inbox folder. Defaults to unread messages in Inbox and includes triage metadata."
+      "description": "Quickly check an inbox or shared inbox folder. Defaults to unread messages in Inbox, newest first, and includes triage metadata."
     },
     {
       "name": "mail_list_folders",

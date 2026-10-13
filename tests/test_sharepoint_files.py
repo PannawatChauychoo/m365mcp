@@ -205,6 +205,10 @@ async def test_search_items_posts_search_query_and_parses_hits() -> None:
         assert req["entityTypes"] == ["driveItem"]
         assert req["query"]["queryString"] == "tracker"
         assert req["size"] == 200  # clamped from 999
+        # Without these the Search API cannot tell folders from files.
+        assert {"isContainer", "contentTypeId", "id", "name", "parentReference"} <= set(
+            req["fields"]
+        )
         return httpx.Response(
             200,
             json={
@@ -236,6 +240,60 @@ async def test_search_items_posts_search_query_and_parses_hits() -> None:
     assert result.items[0].fileExtension == "xlsx"
     await http_client.aclose()
 
+
+
+def _search_hit(name: str, *, mime: str, fields: dict) -> dict:
+    """A driveItem hit shaped like a live Graph /search/query response."""
+    return {
+        "resource": {
+            "@odata.type": "#microsoft.graph.driveItem",
+            "id": f"id-{name}",
+            "name": name,
+            "size": 0,
+            "file": {"mimeType": mime},
+            "parentReference": {"driveId": "drive-9", "siteId": "site-1"},
+            "listItem": {"@odata.type": "#microsoft.graph.listItem", "fields": fields},
+        }
+    }
+
+
+@pytest.mark.anyio
+async def test_search_items_reports_folders_despite_the_file_facet() -> None:
+    hits = [
+        # Live Graph returns folders like this: a file facet, no folder facet.
+        _search_hit(
+            "live-test-files",
+            mime="application/octet-stream",
+            fields={"isContainer": True, "contentTypeId": "0x012000C9EECD600B0E9C48A659CB2B04"},
+        ),
+        # A dotted folder name must not gain a file extension; the content
+        # type alone is enough to recognise it.
+        _search_hit(
+            "Q3.2026",
+            mime="application/octet-stream",
+            fields={"contentTypeId": "0x0120"},
+        ),
+        _search_hit(
+            "Memo.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            fields={"isContainer": False, "contentTypeId": "0x010100F57B7B8FFEA7384BB5"},
+        ),
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"value": [{"hitsContainers": [{"hits": hits}]}]})
+
+    client, http_client = _make_client(handler)
+    result = await client.search_items(query="anything")
+    folder, dotted, memo = result.items
+    assert (folder.isFolder, folder.fileExtension, folder.childCount) == (True, None, None)
+    assert (dotted.isFolder, dotted.fileExtension) == (True, None)
+    assert (memo.isFolder, memo.fileExtension) == (False, "docx")
+
+    # An extension filter keeps folders, as it does for listing children.
+    filtered = await client.search_items(query="anything", extensions=["pdf"])
+    assert [item.name for item in filtered.items] == ["live-test-files", "Q3.2026"]
+    await http_client.aclose()
 
 @pytest.mark.anyio
 async def test_get_item_by_share_url_encodes_url() -> None:

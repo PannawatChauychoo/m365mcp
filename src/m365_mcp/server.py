@@ -1576,7 +1576,9 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
             "Search across everything the signed-in user can access (all "
             "SharePoint sites and OneDrive) for files and folders by name or "
             "content. Best starting point for 'find this file/folder anywhere'. "
-            "Optionally filter to file extensions like ['xlsx', 'pdf']."
+            "Optionally filter to file extensions like ['xlsx', 'pdf']; folders "
+            "are always kept. Folders come back with isFolder=true but no "
+            "childCount; use sharepoint_list_children to see inside one."
         ),
     )
     async def sharepoint_search_items(

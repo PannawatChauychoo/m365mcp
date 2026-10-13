@@ -99,7 +99,7 @@ This MCP server gives Claude local delegated access to one Microsoft 365 account
 ## SharePoint And OneDrive Files
 
 - These tools browse files and folders anywhere the signed-in user has access, without mounting anything locally.
-- Use `sharepoint_search_items` first for "find this file or folder anywhere" — it searches across all SharePoint sites and OneDrive.
+- Use `sharepoint_search_items` first for "find this file or folder anywhere" — it searches across all SharePoint sites and OneDrive. Folders in its results have `isFolder: true` but `childCount: null`; list one with `sharepoint_list_children` to see what is inside. Newly added files can take a while to appear in search; browse the folder if a fresh upload is missing.
 - Use `sharepoint_search_sites` then `sharepoint_list_drives` to go from a site name to its document libraries (each library is a "drive").
 - Use `sharepoint_get_site` when you already know the site hostname and path, for example hostname `contoso.sharepoint.com` and sitePath `Acquisitions`.
 - Use `sharepoint_list_children` to browse a folder by `driveId` plus an `itemId` or a path relative to the drive root; filter with `extensions` (e.g. `["xlsx", "pdf"]`) or `foldersOnly`.

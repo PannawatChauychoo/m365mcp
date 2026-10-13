@@ -258,6 +258,24 @@ class SharePointFilesClient:
         items = self._filter_items(items, extensions=extensions)
         return DriveItemsResult(driveId=driveId, items=items)
 
+    # The Search API returns folders with a ``file`` facet and no ``folder``
+    # facet, so the driveItem shape cannot tell them apart. SharePoint's own
+    # search properties can: ``isContainer`` and the Folder content type
+    # (``0x0120``). Asking for ``fields`` replaces the default properties, so
+    # the driveItem ones _map_item needs are listed too.
+    SEARCH_FIELDS = [
+        "id",
+        "name",
+        "size",
+        "webUrl",
+        "lastModifiedDateTime",
+        "parentReference",
+        "file",
+        "folder",
+        "isContainer",
+        "contentTypeId",
+    ]
+
     async def search_items(
         self,
         *,
@@ -274,6 +292,7 @@ class SharePointFilesClient:
                     "query": {"queryString": query},
                     "from": 0,
                     "size": min(top, 200),
+                    "fields": self.SEARCH_FIELDS,
                 }
             ]
         }
@@ -284,9 +303,14 @@ class SharePointFilesClient:
                 for hit in container.get("hits", []):
                     resource = hit.get("resource") or {}
                     parent = resource.get("parentReference") or {}
-                    items.append(
-                        self._map_item(resource, parent.get("driveId"))
-                    )
+                    item = self._map_item(resource, parent.get("driveId"))
+                    if self._is_search_folder(resource):
+                        # Search reports no child count for folders; list the
+                        # folder's children to see what is inside.
+                        item.isFolder = True
+                        item.fileExtension = None
+                        item.childCount = None
+                    items.append(item)
         items = self._filter_items(items, extensions=extensions)
         return DriveItemsResult(items=items)
 
@@ -441,6 +465,15 @@ class SharePointFilesClient:
             displayName=data.get("displayName"),
             webUrl=data.get("webUrl"),
         )
+
+    @staticmethod
+    def _is_search_folder(resource: dict[str, Any]) -> bool:
+        if resource.get("folder") is not None:
+            return True
+        fields = (resource.get("listItem") or {}).get("fields") or {}
+        if fields.get("isContainer") is True:
+            return True
+        return str(fields.get("contentTypeId") or "").upper().startswith("0X0120")
 
     @staticmethod
     def _map_item(data: dict[str, Any], driveId: str | None) -> DriveItemInfo:

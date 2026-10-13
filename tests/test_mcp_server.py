@@ -6,6 +6,7 @@ import json
 import socket
 from pathlib import Path
 
+import anyio
 import httpx
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
@@ -183,6 +184,7 @@ async def test_mcp_server_exposes_expected_tools_and_structured_outputs(config_f
             "sharepoint_list_children",
             "sharepoint_search_in_drive",
             "sharepoint_get_item_by_url",
+            "sharepoint_get_file_content",
             "sharepoint_list_permissions",
             "sharepoint_create_link",
             "sharepoint_grant_access",
@@ -345,6 +347,51 @@ async def test_sharepoint_mutations_require_confirmation(config_factory) -> None
     assert create.isError is True
     assert grant.isError is True
     assert revoke.isError is True
+    await http_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_sharepoint_get_file_content_returns_structured_text(config_factory) -> None:
+    class TokenAuthService(StubAuthService):
+        async def get_access_token(self) -> str:
+            return "access-token"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "graph.microsoft.com":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "item-1",
+                    "name": "notes.md",
+                    "file": {},
+                    "size": 8,
+                    "@microsoft.graph.downloadUrl": "https://files.example/dl",
+                },
+            )
+        return httpx.Response(200, content=b"# Notes\n")
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    runtime = RuntimeServices(
+        config=config_factory(localBaseUrl="http://localhost:8787"),
+        microsoft_auth=StubAuthService(),
+        graph=StubGraphClient(),
+        sharepoint=SharePointFilesClient(TokenAuthService(), http_client),
+        excel=ExcelWorkbookClient(TokenAuthService(), http_client),
+        http_client=http_client,
+        owns_http_client=False,
+        start_helper_server=False,
+    )
+    server = create_mcp_server(runtime)
+
+    async with create_connected_server_and_client_session(server, raise_exceptions=True) as session:
+        result = await session.call_tool(
+            "sharepoint_get_file_content", {"driveId": "drive-1", "itemId": "item-1"}
+        )
+
+    assert result.isError is False
+    assert result.structuredContent["content"] == "# Notes\n"
+    assert result.structuredContent["encoding"] == "utf-8"
+    assert result.structuredContent["item"]["name"] == "notes.md"
     await http_client.aclose()
 
 
@@ -519,6 +566,91 @@ async def test_mcp_server_stays_up_when_helper_port_is_busy(config_factory) -> N
     finally:
         sock.close()
         await http_client.aclose()
+
+
+@pytest.mark.anyio
+async def test_mcp_server_stays_up_when_helper_port_is_taken_after_check(
+    config_factory, monkeypatch, capsys
+) -> None:
+    # Claude Desktop starts two copies at once; both can pass the free-port
+    # check before either binds, so the loser only finds out from uvicorn.
+    # The first check sees a free port; the re-check after the failed bind
+    # sees it taken, which is what identifies the race.
+    checks = iter([True])
+    monkeypatch.setattr(
+        "m365_mcp.server._can_bind_localhost", lambda port: next(checks, False)
+    )
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen()
+    port = sock.getsockname()[1]
+
+    http_client = httpx.AsyncClient()
+    runtime = RuntimeServices(
+        config=config_factory(
+            port=port,
+            localBaseUrl=f"http://localhost:{port}",
+        ),
+        microsoft_auth=StubAuthService(),
+        graph=StubGraphClient(),
+        sharepoint=SharePointFilesClient(StubAuthService(), http_client),
+        excel=ExcelWorkbookClient(StubAuthService(), http_client),
+        http_client=http_client,
+        owns_http_client=False,
+        start_helper_server=True,
+    )
+    server = create_mcp_server(runtime)
+
+    try:
+        async with create_connected_server_and_client_session(
+            server,
+            raise_exceptions=True,
+        ) as session:
+            auth_status = await session.call_tool("auth_status", {})
+            assert auth_status.structuredContent["connected"] is True
+    finally:
+        sock.close()
+        await http_client.aclose()
+    # The helper really lost the bind and took the race path.
+    assert "already in use" in capsys.readouterr().err
+
+
+@pytest.mark.anyio
+async def test_helper_startup_errors_are_not_reported_as_a_busy_port(
+    monkeypatch, capsys
+) -> None:
+    import types
+
+    from m365_mcp import server as server_module
+
+    class FailingServer:
+        started = False
+        should_exit = False
+
+        def __init__(self, config) -> None:
+            pass
+
+        async def serve(self) -> None:
+            raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(server_module, "_can_bind_localhost", lambda port: True)
+    monkeypatch.setattr(server_module, "create_helper_app", lambda *args: None)
+    monkeypatch.setattr(server_module.uvicorn, "Config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server_module.uvicorn, "Server", FailingServer)
+    runtime = types.SimpleNamespace(
+        config=types.SimpleNamespace(port=8787), microsoft_auth=None
+    )
+
+    runner = server_module._HelperServerRunner(runtime)
+    with pytest.raises(BaseException) as raised:
+        await runner.run(task_status=anyio.TASK_STATUS_IGNORED)
+
+    def leaves(error: BaseException) -> list[BaseException]:
+        inner = getattr(error, "exceptions", None)
+        return [leaf for child in inner for leaf in leaves(child)] if inner else [error]
+
+    assert any(isinstance(leaf, PermissionError) for leaf in leaves(raised.value))
+    assert "already in use" not in capsys.readouterr().err
 
 
 @pytest.mark.anyio

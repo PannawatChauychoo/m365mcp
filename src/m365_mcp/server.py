@@ -53,6 +53,9 @@ from m365_mcp.microsoft_graph import (
     MicrosoftGraphClient,
 )
 from m365_mcp.sharepoint_files import (
+    DEFAULT_FILE_MAX_BYTES,
+    DEFAULT_FILE_MAX_CHARS,
+    DriveItemContentResult,
     DriveItemInfo,
     DriveItemsResult,
     DrivesResult,
@@ -241,14 +244,7 @@ class _HelperServerRunner:
 
     async def run(self, *, task_status: anyio.abc.TaskStatus[None]) -> None:
         if not _can_bind_localhost(self._runtime.config.port):
-            print(
-                "Claude M365 MCP local helper was not started because "
-                f"localhost:{self._runtime.config.port} is already in use. "
-                "Close the other process using that port, or set PORT and "
-                "LOCAL_BASE_URL to a different localhost port that also matches "
-                "the Azure redirect URI.",
-                file=sys.stderr,
-            )
+            self._report_port_in_use()
             task_status.started()
             return
 
@@ -293,8 +289,29 @@ class _HelperServerRunner:
             task_group.start_soon(wait_until_started)
             try:
                 await server.serve()
+            except (SystemExit, OSError):
+                # Another copy can take the port between the check above and
+                # the bind (Claude Desktop starts two at once). uvicorn reports
+                # a failed bind with sys.exit(1); keep the MCP server running.
+                # Anything else, including a failure while the port is still
+                # free, is a real error and is not hidden.
+                if server.started or _can_bind_localhost(self._runtime.config.port):
+                    raise
+                self._server = None
+                self._report_port_in_use()
+                task_status.started()
             finally:
                 task_group.cancel_scope.cancel()
+
+    def _report_port_in_use(self) -> None:
+        print(
+            "Claude M365 MCP local helper was not started because "
+            f"localhost:{self._runtime.config.port} is already in use. "
+            "Close the other process using that port, or set PORT and "
+            "LOCAL_BASE_URL to a different localhost port that also matches "
+            "the Azure redirect URI.",
+            file=sys.stderr,
+        )
 
     async def stop(self) -> None:
         if self._server is not None:
@@ -1758,6 +1775,31 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
     ) -> DriveItemInfo:
         runtime = runtime_provider.get()
         return await runtime.sharepoint.get_item_by_share_url(shareUrl=shareUrl)
+
+    @mcp.tool(
+        name="sharepoint_get_file_content",
+        description=(
+            "Read a Word (.docx, .docm, .dotx, .dotm), PDF, or text (.md, .txt, "
+            ".csv, .json, ...) file from SharePoint or OneDrive by driveId and "
+            "itemId. Word comes back as Markdown (headings, lists, tables), PDF "
+            "as its text layer per page, and text files as-is. maxBytes is capped "
+            "at 50 MB and maxChars at 500,000. Excel files use the workbook "
+            "tools; other types return unsupportedReason. Nothing is saved to disk."
+        ),
+    )
+    async def sharepoint_get_file_content(
+        driveId: str,
+        itemId: str,
+        maxBytes: int = DEFAULT_FILE_MAX_BYTES,
+        maxChars: int = DEFAULT_FILE_MAX_CHARS,
+    ) -> DriveItemContentResult:
+        runtime = runtime_provider.get()
+        return await runtime.sharepoint.get_file_content(
+            driveId=driveId,
+            itemId=itemId,
+            maxBytes=maxBytes,
+            maxChars=maxChars,
+        )
 
     @mcp.tool(
         name="sharepoint_list_permissions",

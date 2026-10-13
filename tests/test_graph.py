@@ -574,7 +574,7 @@ async def test_get_messages_retries_throttled_items(monkeypatch: pytest.MonkeyPa
 def test_batch_retry_after_is_bounded() -> None:
     wait = MicrosoftGraphClient._retry_after_seconds
     assert wait({"headers": {"retry-after": "3"}}, 0) == 3.0
-    assert wait({"headers": {"Retry-After": "3600"}}, 0) == 30.0
+    assert wait({"headers": {"Retry-After": "3600"}}, 0) == 20.0
     # Missing or unparseable Retry-After backs off exponentially.
     assert wait({}, 0) == 1.0
     assert wait({"headers": {"Retry-After": "soon"}}, 2) == 4.0
@@ -618,7 +618,7 @@ async def test_get_messages_retry_waits_share_one_budget(
             200,
             json={
                 "responses": [
-                    {"id": inner["id"], "status": 429, "headers": {"Retry-After": "30"}}
+                    {"id": inner["id"], "status": 429, "headers": {"Retry-After": "8"}}
                     for inner in payload["requests"]
                 ]
             },
@@ -631,7 +631,9 @@ async def test_get_messages_retry_waits_share_one_budget(
 
     # Three chunks, each always throttled: the waits across all of them stay
     # inside one per-call budget instead of 3 x 3 x 30 s.
-    assert sum(sleeps) <= graph_module.BATCH_RETRY_BUDGET_SECONDS
+    # 8 + 8 fit the 20 s budget; a third 8 s wait would not, in this chunk
+    # or the later ones, so they give up without sleeping.
+    assert sleeps == [8.0, 8.0]
     assert all(item.error and "429" in item.error for item in result.messages)
     await client.aclose()
 
@@ -728,6 +730,8 @@ async def test_get_message_returns_full_body_for_forwards() -> None:
             "fw": "FW: Rent roll",
             "fwd": "Fwd: Rent roll",
             "re-fw": "RE: [EXT] Fw: Rent roll",
+            "vb": "VB: Hyreslista",
+            "vs": "VS: Vuokralista",
             "wg": "AW: WG: Mietliste",
             "tr": "TR: Liste des loyers",
             "rv": "RV: Lista de alquileres",
@@ -751,7 +755,7 @@ async def test_get_message_returns_full_body_for_forwards() -> None:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     graph = MicrosoftGraphClient(StaticAuthService(), client)
 
-    for message_id in ("fw", "fwd", "re-fw", "wg", "tr", "rv"):
+    for message_id in ("fw", "fwd", "re-fw", "wg", "tr", "rv", "vb", "vs"):
         forwarded = await graph.get_message(messageId=message_id)
         assert forwarded.message.bodyScope == "full", message_id
         assert "Rent roll attached." in forwarded.message.body.content
@@ -2328,4 +2332,68 @@ async def test_add_and_remove_categories_read_only_categories() -> None:
     await graph.add_message_categories(messageId="msg-1", categories=["B", "C"])
     await graph.remove_message_categories(messageId="msg-1", categories=["A"])
     assert patches == [["A", "B", "C"], ["B"]]
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_get_messages_survives_non_json_errors_and_network_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(graph_module.anyio, "sleep", fake_sleep)
+    calls = {"second": 0, "third": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        ids = [_inner_message_id(inner) for inner in payload["requests"]]
+        if "m25" in ids:
+            calls["second"] += 1
+            if calls["second"] == 1:
+                raise httpx.ConnectError("connection reset")
+        if "m45" in ids:
+            calls["third"] += 1
+            return httpx.Response(
+                502, text="<html><body>Bad gateway</body></html>"
+            )
+        return httpx.Response(
+            200,
+            json={
+                "responses": [
+                    _message_response(inner, _inner_message_id(inner))
+                    for inner in payload["requests"]
+                ]
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    graph = MicrosoftGraphClient(StaticAuthService(), client)
+    result = await graph.get_messages(messageIds=[f"m{index}" for index in range(50)])
+
+    # A network error is retried and the chunk then reads normally.
+    assert calls["second"] == 2
+    assert all(item.message is not None for item in result.messages[:40])
+    # An HTML 502 is not JSON: it becomes per-item errors, not a crash.
+    assert calls["third"] == 1
+    for item in result.messages[40:]:
+        assert item.message is None
+        assert "502" in item.error
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_request_reports_non_json_error_bodies() -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(503, text="<html>Service Unavailable</html>")
+        )
+    )
+    graph = MicrosoftGraphClient(StaticAuthService(), client)
+    with pytest.raises(graph_module.GraphRequestError) as raised:
+        await graph._request("/me/messages")
+    assert raised.value.status == 503
+    assert "503" in str(raised.value)
     await client.aclose()

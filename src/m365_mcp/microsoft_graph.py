@@ -113,7 +113,8 @@ MAIL_GET_MESSAGES_LIMIT = 50
 # many times, waiting for the longest Retry-After (capped) between attempts.
 BATCH_THROTTLE_RETRIES = 3
 BATCH_RETRY_STATUSES = {429, 503, 504}
-BATCH_MAX_RETRY_AFTER_SECONDS = 30.0
+# Longest single wait; in practice the shared budget below is the tighter limit.
+BATCH_MAX_RETRY_AFTER_SECONDS = 20.0
 # Total time one call may spend waiting between retries, across every
 # 20-item chunk, so a tool call finishes well inside MCP client timeouts.
 BATCH_RETRY_BUDGET_SECONDS = 20.0
@@ -2242,7 +2243,13 @@ class MicrosoftGraphClient:
         if response.status_code == 204:
             return None
 
-        data = response.json() if response.text else None
+        try:
+            data = response.json() if response.text else None
+        except ValueError:
+            # Proxies and gateways can answer with HTML or plain text.
+            if response.is_success:
+                raise
+            data = None
         if not response.is_success:
             error_message = (
                 data.get("error", {}).get("message")
@@ -2290,7 +2297,8 @@ class MicrosoftGraphClient:
                         "/$batch", method="POST", json_body={"requests": pending}
                     )
                 except (GraphRequestError, httpx.HTTPError) as error:
-                    status = getattr(error, "status", None)
+                    # A network error carries no status; retry it like a 503.
+                    status = getattr(error, "status", None) or 503
                     for request in pending:
                         responses[str(request["id"])] = {
                             "id": request["id"],

@@ -3,7 +3,7 @@
 Used by sharepoint_files.py to read Word, PDF, and plain-text files stored in
 SharePoint/OneDrive. Everything is parsed in memory; nothing is written to disk.
 
-- Plain text (.md, .txt, .csv, ...) is decoded as UTF-8 (UTF-16 when a BOM says so).
+- Plain text (.md, .txt, .csv, ...) is decoded as UTF-8 (UTF-16/32 when a BOM says so).
 - Word (.docx, .docm, .dotx, .dotm) is rendered as Markdown in document order:
   headings become `#`, list paragraphs become `-` / `1.` items, and tables become
   Markdown tables. Macros in .docm/.dotm are never run; only the text is read.
@@ -13,8 +13,9 @@ Both parsers are optional imports, like PdfReader in microsoft_graph.py, so a
 missing dependency becomes a readable reason instead of an import error.
 Unreadable files raise DocumentTextError, which callers turn into an
 unsupportedReason. Extraction stops once it has more than ``max_chars``
-characters (and PDFs after MAX_PDF_PAGES pages), so a large or crafted file
-cannot keep a worker thread busy for long.
+characters (and PDFs after MAX_PDF_PAGES pages). That limits work between
+pages and paragraphs, not within one: a single huge PDF page or Word table
+still runs to completion, bounded only by the download and archive limits.
 """
 
 from __future__ import annotations
@@ -145,6 +146,9 @@ def unreadable_reason(extension: str | None) -> str:
 
 
 def decode_text(content: bytes) -> str:
+    # The UTF-32-LE BOM starts with the UTF-16-LE one, so check UTF-32 first.
+    if content.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        return content.decode("utf-32", errors="replace")
     if content.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
         return content.decode("utf-16", errors="replace")
     return content.decode("utf-8-sig", errors="replace")

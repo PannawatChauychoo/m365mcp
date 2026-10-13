@@ -769,6 +769,40 @@ async def test_get_file_content_reads_macro_enabled_and_template_word_files(
 
 
 @pytest.mark.anyio
+async def test_get_file_content_reads_word_file_with_svg_doctype_image() -> None:
+    import io
+    import zipfile
+
+    from tests.test_zip_guard import SVG_WITH_DOCTYPE
+
+    # Illustrator-style SVGs start with <!DOCTYPE svg ...>; the guard must
+    # not mistake that media part for an XML part with a DTD.
+    output = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(_docx_bytes())) as source, zipfile.ZipFile(
+        output, "w", zipfile.ZIP_DEFLATED
+    ) as copy:
+        for info in source.infolist():
+            copy.writestr(info, source.read(info))
+        copy.writestr("word/media/image1.svg", SVG_WITH_DOCTYPE)
+
+    client, http_client = _make_client(_file_handler("Memo.docx", output.getvalue()))
+    result = await client.get_file_content(driveId="drive-1", itemId="item-1")
+
+    assert result.unsupportedReason is None
+    assert result.content.startswith("# Investment Memo")
+    await http_client.aclose()
+
+
+def test_decode_text_reads_utf32_before_utf16() -> None:
+    from m365_mcp.document_text import decode_text
+
+    text = "Rent roll, café"
+    assert decode_text(b"\xff\xfe\x00\x00" + text.encode("utf-32-le")) == text
+    assert decode_text(b"\x00\x00\xfe\xff" + text.encode("utf-32-be")) == text
+    assert decode_text(b"\xff\xfe" + text.encode("utf-16-le")) == text
+
+
+@pytest.mark.anyio
 async def test_get_file_content_clamps_max_bytes_and_max_chars() -> None:
     from m365_mcp.sharepoint_files import MAX_FILE_MAX_BYTES, MAX_FILE_MAX_CHARS
 

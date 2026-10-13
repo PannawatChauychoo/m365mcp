@@ -36,7 +36,7 @@ def test_counts_inflated_bytes_against_the_compression_ratio() -> None:
     # 2 MB of zeros deflates to a few KB: well under the absolute limit, far
     # over 100x the compressed size.
     content = _zip({"word/document.xml": b"\0" * 2_000_000})
-    with pytest.raises(ZipGuardError, match="expands to more than"):
+    with pytest.raises(ZipGuardError, match="compression ratio"):
         _check(content)
 
 
@@ -72,3 +72,32 @@ def test_finds_a_doctype_split_across_read_chunks() -> None:
     content = _zip({"word/document.xml": prefix + b"<!DOCTYPE x><x/>"})
     with pytest.raises(ZipGuardError, match="document type declaration"):
         _check(content, max_ratio=100_000)
+
+
+SVG_WITH_DOCTYPE = (
+    b'<?xml version="1.0"?>\n<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" '
+    b'"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">\n<svg/>'
+)
+
+
+@pytest.mark.parametrize(
+    ("name", "data"),
+    [
+        ("word/media/image1.svg", SVG_WITH_DOCTYPE),
+        ("word/afchunk.html", b"<!DOCTYPE html><html><body>Hi</body></html>"),
+    ],
+)
+def test_ignores_a_doctype_in_media_parts(name: str, data: bytes) -> None:
+    _check(_zip({"word/document.xml": b"<w:document/>", name: data}))
+
+
+def test_refuses_a_doctype_in_a_relationships_part() -> None:
+    content = _zip({"word/_rels/document.xml.rels": b"<!DOCTYPE x><Relationships/>"})
+    with pytest.raises(ZipGuardError, match="document type declaration"):
+        _check(content)
+
+
+def test_counts_media_parts_against_the_size_limits() -> None:
+    content = _zip({"word/document.xml": b"<w:document/>", "word/media/big.svg": b"\0" * 2_000_000})
+    with pytest.raises(ZipGuardError, match="compression ratio"):
+        _check(content)

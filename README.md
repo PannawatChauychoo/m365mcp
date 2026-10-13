@@ -333,6 +333,7 @@ Mail and folders:
 - `mail_list`
 - `mail_search`
 - `mail_get`
+- `mail_get_messages`
 - `mail_list_drafts`
 - `mail_create_draft`
 - `mail_send`
@@ -438,8 +439,17 @@ Excel workbooks:
 - Prefer `mail_check_inbox` or `mail_list` filters for fast inbox triage. `mail_search` uses Microsoft Graph `$search`, which can be slower on large mailboxes.
 - `mail_list` sorts by received time (`order`, newest first by default), filters by `receivedAfter`/`receivedBefore`, and pages with an opaque `cursor`/`nextCursor`. The cursor carries only Graph's own continuation (`$skip`/`$skiptoken` from `@odata.nextLink`, which counts scanned items when a filter is applied); the next call rebuilds the request from its arguments, so the link is never followed. The cursor also carries a fingerprint of the mailbox, folder, filter, and order, and is refused if a later call changes any of them. Graph only allows `$orderby` together with `$filter` when the sorted property is filtered first, so the server always leads the filter with a `receivedDateTime` bound (a no-op lower bound when no date is given).
 - `mail_check_inbox` is built on `mail_list`, so it now also always sends `$orderby=receivedDateTime desc` and returns the newest messages first. Before, the order was whatever Graph returned by default.
-- `mail_get_thread` sorts returned thread messages locally by received time when available instead of asking Graph to sort a filtered conversation query.
+- `mail_get_thread` asks Graph for the thread sorted by received time with `$top` (one request; the filter leads with a no-op `receivedDateTime` bound because Graph only allows `$orderby` with `$filter` when the sorted property is filtered first). `truncated` is set when the thread has more messages, and `messageCount` is then null.
+- `mail_get` and `mail_get_messages` return plain-text bodies holding only the part new to each message (Graph `uniqueBody`) by default, falling back to the full body when Graph has no separate new part and for forwards (detected by subject prefix: `FW:`/`Fwd:` and the German, French, Spanish, and Nordic equivalents); `bodyScope="full"` and `bodyFormat="html"` restore the full HTML body.
+- `mail_get_messages` uses Graph `$batch` (20 per request) and retries throttled (429) or unavailable (503/504) items up to 3 times, waiting for Graph's `Retry-After`. All waits in one call share a 20-second budget, and a wait longer than what is left is not attempted. A failed `$batch` request, including a throttled one or a network error (both retried the same way), becomes a per-message error for that chunk instead of failing the whole call.
 - `mail_update_category` can update an Outlook master category color. Microsoft Graph does not support renaming an existing master category; create a new category and delete the old one only after confirming that is safe.
+
+### Behaviour changes for existing callers
+
+These defaults changed on purpose to cut the tokens a mail read costs:
+
+- **`mail_get` body:** was the full HTML body; now plain text holding only the new part. Pass `bodyFormat="html"` and `bodyScope="full"` for the old output. That is also what `mail_get_inline_images` needs to place `cid:` pictures, since it matches the HTML body.
+- **`mail_get_thread` order:** was oldest first; now newest first, and `top` keeps the newest messages. Pass `order="oldest"` for the old order.
 
 ## SharePoint And Excel Notes
 

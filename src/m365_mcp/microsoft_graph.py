@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import httpx
 
@@ -114,6 +116,14 @@ CONTACT_EXTENDED_PROPERTIES_EXPAND = (
     f"'{PERSONAL_HOME_PAGE_EXTENDED_PROPERTY_ID}')"
 )
 CONTACT_FOLDER_SELECT = "id,displayName,parentFolderId"
+# YYYY-MM-DD, optionally followed by a time and a Z or +HH:MM/+HHMM/+HH offset.
+_ISO_DATETIME_RE = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})"
+    r"(?:[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:[.,](\d{1,7}))?)?)?"
+    r"(Z|z|[+-]\d{2}(?::?\d{2})?)?"
+)
+# Graph continuation parameters carried in a mail_list cursor.
+_MAIL_LIST_CURSOR_KEYS = {"$skip", "$skiptoken"}
 
 
 def _build_contact_read_query(*, top: int | None = None) -> str:
@@ -242,7 +252,20 @@ class MicrosoftGraphClient:
         categories: list[str] | None = None,
         flagStatus: str | None = None,
         inferenceClassification: str | None = None,
+        receivedAfter: str | None = None,
+        receivedBefore: str | None = None,
+        order: str = "newest",
+        cursor: str | None = None,
     ) -> MailListResult:
+        if order not in ("newest", "oldest"):
+            raise ValueError('order must be "newest" or "oldest"')
+        page_params, cursor_scope = self._mail_list_cursor_params(cursor)
+        after = self._graph_datetime(receivedAfter, "receivedAfter")
+        before = self._graph_datetime(receivedBefore, "receivedBefore")
+        if after and before and after[1] >= before[1]:
+            raise ValueError("receivedAfter must be earlier than receivedBefore")
+        received_after = after[0] if after else None
+        received_before = before[0] if before else None
         normalized_mailbox = self._normalize_mailbox(mailbox)
         base = self._base_path(normalized_mailbox)
         resolved_folder_id = folderId
@@ -264,23 +287,49 @@ class MicrosoftGraphClient:
             flagStatus=flagStatus,
             inferenceClassification=inferenceClassification,
         )
+        # Graph rejects $orderby with $filter ("InefficientFilter") unless the
+        # sorted property is also filtered, and filtered first. A no-op lower
+        # bound keeps the sort working alongside the other filters.
+        date_filters: list[str] = []
+        if received_after:
+            date_filters.append(f"receivedDateTime ge {received_after}")
+        elif filters or received_before:
+            date_filters.append("receivedDateTime ge 1900-01-01T00:00:00Z")
+        if received_before:
+            date_filters.append(f"receivedDateTime lt {received_before}")
+        filters = date_filters + filters
         params: dict[str, str] = {
             "$top": str(min(top, 100)),
             "$select": MESSAGE_SUMMARY_SELECT,
+            "$orderby": f"receivedDateTime {'desc' if order == 'newest' else 'asc'}",
         }
         if filters:
             params["$filter"] = " and ".join(filters)
+        path = self._mail_folder_messages_path(base, legacy_folder, resolved_folder_id)
+        scope = self._mail_list_scope(path, params)
+        if cursor_scope is not None and cursor_scope != scope:
+            raise ValueError(
+                "cursor was returned for different mail_list arguments; pass the "
+                "same mailbox, folder, filters, and order as the call that "
+                "returned it, or omit cursor to start again"
+            )
+        params.update(page_params)
         query = httpx.QueryParams(params)
-        result = await self._request(
-            f"{self._mail_folder_messages_path(base, legacy_folder, resolved_folder_id)}?{query}"
-        )
+        result = await self._request(f"{path}?{query}")
 
+        messages = [self._map_message_summary(message) for message in result["value"]]
+        next_cursor = self._mail_list_next_cursor(result.get("@odata.nextLink"), scope)
         return MailListResult(
             mailbox=normalized_mailbox or "me",
             folder=folder,
             folderId=resolved_folder_id,
             folderPath=resolved_folder_path,
-            messages=[self._map_message_summary(message) for message in result["value"]],
+            order=order,
+            receivedAfter=received_after,
+            receivedBefore=received_before,
+            hasMore=next_cursor is not None,
+            nextCursor=next_cursor,
+            messages=messages,
         )
 
     async def check_inbox(
@@ -2225,6 +2274,116 @@ class MicrosoftGraphClient:
                 f"'{self._escape_odata_string(inferenceClassification)}'"
             )
         return filters
+
+    @staticmethod
+    def _graph_datetime(
+        value: str | None, name: str
+    ) -> tuple[str, tuple[datetime, int]] | None:
+        """Normalize an ISO 8601 date or date-time to a UTC OData literal.
+
+        Returns the literal and a sort key. A value without an offset
+        (including a bare date) is read as UTC. Parsed by hand rather than
+        with datetime.fromisoformat, which accepts different formats on
+        Python 3.10 and 3.11+, and so fractional seconds of any precision
+        survive unchanged."""
+        text = (value or "").strip()
+        if not text:
+            return None
+        invalid = ValueError(
+            f"{name} must be an ISO 8601 date or date-time, such as "
+            f"2026-10-01 or 2026-10-01T09:00:00-05:00; got {value!r}"
+        )
+        match = _ISO_DATETIME_RE.fullmatch(text)
+        if not match:
+            raise invalid
+        year, month, day, hour, minute, second, fraction, zone = match.groups()
+        if int(year) < 1900:
+            raise ValueError(f"{name} must be in 1900 or later; got {value!r}")
+        offset = timedelta(0)
+        if zone and zone not in "Zz":
+            sign = -1 if zone[0] == "-" else 1
+            digits = zone[1:].replace(":", "")
+            if int(digits[2:] or 0) > 59:
+                raise invalid
+            offset = sign * timedelta(hours=int(digits[:2]), minutes=int(digits[2:] or 0))
+        try:
+            parsed = datetime(
+                int(year),
+                int(month),
+                int(day),
+                int(hour or 0),
+                int(minute or 0),
+                int(second or 0),
+                tzinfo=timezone(offset),
+            ).astimezone(timezone.utc)
+        except (ValueError, OverflowError) as exc:
+            raise invalid from exc
+        literal = parsed.strftime("%Y-%m-%dT%H:%M:%S")
+        if fraction:
+            literal += f".{fraction}"
+        return f"{literal}Z", (parsed, int((fraction or "").ljust(9, "0")))
+
+    @staticmethod
+    def _mail_list_scope(path: str, params: dict[str, str]) -> str:
+        """Fingerprint of what a mail_list page lists (mailbox, folder,
+        filter, order), so a cursor is only accepted by the query that made
+        it. ``$top`` is left out: changing the page size is harmless."""
+        key = "\n".join((path, params.get("$filter", ""), params.get("$orderby", "")))
+        return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _mail_list_next_cursor(next_link: str | None, scope: str) -> str | None:
+        """Turn Graph's @odata.nextLink into an opaque mail_list cursor.
+
+        With a $filter, Graph's continuation $skip counts mailbox items
+        scanned rather than messages returned, so only Graph's own value pages
+        correctly. Only the continuation parameters are kept; the next call
+        rebuilds the request from its own arguments, so the link itself is
+        never followed and the token never leaves graph.microsoft.com."""
+        if not next_link:
+            return None
+        parts = urlsplit(next_link)
+        if parts.scheme != "https" or parts.hostname != "graph.microsoft.com":
+            return None
+        continuation = [
+            (key, value)
+            for key, value in parse_qsl(parts.query)
+            if key in _MAIL_LIST_CURSOR_KEYS
+        ]
+        if not continuation:
+            return None
+        payload = urlencode([*continuation, ("scope", scope)])
+        return base64.urlsafe_b64encode(payload.encode()).decode()
+
+    @staticmethod
+    def _mail_list_cursor_params(
+        cursor: str | None,
+    ) -> tuple[dict[str, str], str | None]:
+        """Decode a mail_list cursor into Graph continuation parameters and
+        the scope fingerprint of the query that produced it."""
+        if not cursor:
+            return {}, None
+        invalid = ValueError(
+            "cursor must be a nextCursor value returned by mail_list"
+        )
+        try:
+            pairs = parse_qsl(
+                base64.urlsafe_b64decode(cursor.encode()).decode(),
+                strict_parsing=True,
+            )
+        except ValueError as exc:
+            raise invalid from exc
+        params = dict(pairs)
+        scope = params.pop("scope", None)
+        if (
+            len(params) + 1 != len(pairs)
+            or not params
+            or not scope
+            or not set(params) <= _MAIL_LIST_CURSOR_KEYS
+            or not re.fullmatch(r"[0-9]+", params.get("$skip", "0"))
+        ):
+            raise invalid
+        return params, scope
 
     def _escape_odata_string(self, value: str) -> str:
         return value.replace("'", "''")

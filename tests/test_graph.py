@@ -2422,8 +2422,8 @@ async def test_workbook_attachment_refuses_deleted_cell_names() -> None:
         assert refused.values is None
         assert "#REF!" in refused.error and "deleted" in refused.error
     # The error is labelled with the sheet the request named.
-    assert deleted.worksheet == ""
-    assert scoped.worksheet == "Assump"
+    assert (deleted.worksheet, deleted.address) == ("", "Deleted")
+    assert (scoped.worksheet, scoped.address) == ("Assump", "Deleted")
     assert price.values == [[200]]
 
     await client.aclose()
@@ -2443,7 +2443,9 @@ async def test_workbook_attachment_refuses_row_zero() -> None:
     for data in refused:
         assert data.values is None
         assert "rows and columns start at 1" in data.error
-    assert refused[3].worksheet == "Assump"
+    # An error splits sheet and address the same way a successful read does.
+    assert (refused[3].worksheet, refused[3].address) == ("Assump", "B0")
+    assert refused[0].address == "A0:B2"
     assert read.address == "A1:B2"
     assert read.values == [["Label 1", 100], ["Label 2", 200]]
 

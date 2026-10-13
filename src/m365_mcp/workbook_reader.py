@@ -333,7 +333,7 @@ def _read(
             data, used = (
                 AttachmentRangeData(
                     worksheet=_requested_sheet(request) or sheet or "",
-                    address=request or "",
+                    address=_requested_address(request),
                     error=message,
                 ),
                 0,
@@ -724,6 +724,13 @@ def _requested_sheet(request: str | None) -> str | None:
     if request is None or "!" not in request:
         return None
     return _unquote_sheet_name(request.strip().rpartition("!")[0]) or None
+
+
+def _requested_address(request: str | None) -> str:
+    """The cells or name of a request without its sheet, like a read's address."""
+    if request is None:
+        return ""
+    return request.strip().rpartition("!")[2].strip()
 
 
 def _unquote_sheet_name(sheet_part: str) -> str:

@@ -72,6 +72,9 @@ class FullMessage(AppModel):
     sentDateTime: str | None = None
     bodyPreview: str
     body: MessageBody
+    # "new" when body holds only this message's own text (Graph uniqueBody),
+    # "full" when it holds the whole body including quoted history.
+    bodyScope: Literal["new", "full"] = "full"
     webLink: str | None = None
     isDraft: bool
     isRead: bool | None = None
@@ -109,6 +112,12 @@ class MailListResult(AppModel):
     folder: str
     folderId: str | None = None
     folderPath: str | None = None
+    order: Literal["newest", "oldest"] = "newest"
+    receivedAfter: str | None = None
+    receivedBefore: str | None = None
+    hasMore: bool = False
+    # Pass as `cursor`, with the same other arguments, to read the next page.
+    nextCursor: str | None = None
     messages: list[MessageSummary]
 
 
@@ -145,6 +154,21 @@ class MailSearchResult(AppModel):
 class MailGetResult(AppModel):
     mailbox: str
     message: FullMessage
+
+
+class MailGetMessagesItem(AppModel):
+    """One message inside a batch read. ``error`` is set (and ``message`` is
+    None) when that message could not be read; the rest of the batch is
+    unaffected."""
+
+    messageId: str
+    message: FullMessage | None = None
+    error: str | None = None
+
+
+class MailGetMessagesResult(AppModel):
+    mailbox: str
+    messages: list[MailGetMessagesItem]
 
 
 class MailListDraftsResult(AppModel):
@@ -291,6 +315,11 @@ class MailAttachmentPdfResult(AppModel):
 class MailThreadResult(AppModel):
     mailbox: str
     conversationId: str
+    order: Literal["newest", "oldest"] = "newest"
+    # Thread size; None when the thread has more messages than were returned.
+    messageCount: int | None = None
+    # True when the thread holds more messages than `messages`.
+    truncated: bool = False
     messages: list[MessageSummary]
 
 

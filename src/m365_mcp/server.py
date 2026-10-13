@@ -86,6 +86,7 @@ from m365_mcp.models import (
     MailCreateDraftResult,
     MailFolderMutationResult,
     MailFolderTreeResult,
+    MailGetMessagesResult,
     MailGetResult,
     MailInlineImagesResult,
     MailListAttachmentsResult,
@@ -439,8 +440,14 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
     @mcp.tool(
         name="mail_list",
         description=(
-            "List messages from a mailbox folder. Use mailbox for shared/delegated "
-            "mailboxes the signed-in Microsoft user can access."
+            "List messages from a mailbox folder, newest first by default "
+            '(order="oldest" reverses). receivedAfter (inclusive) and '
+            "receivedBefore (exclusive) take ISO 8601 dates or date-times, read "
+            "as UTC unless an offset is given, and combine with the other "
+            "filters, including inferenceClassification for Focused/Other. "
+            "When hasMore is true, call again with the same arguments and "
+            "cursor=nextCursor for the next page. Use mailbox for "
+            "shared/delegated mailboxes the signed-in Microsoft user can access."
         ),
     )
     async def mail_list(
@@ -455,6 +462,10 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
         categories: list[str] | None = None,
         flagStatus: Literal["notFlagged", "flagged", "complete"] | None = None,
         inferenceClassification: Literal["focused", "other"] | None = None,
+        receivedAfter: str | None = None,
+        receivedBefore: str | None = None,
+        order: Literal["newest", "oldest"] = "newest",
+        cursor: str | None = None,
     ) -> MailListResult:
         runtime = runtime_provider.get()
         return await runtime.graph.list_messages(
@@ -469,13 +480,17 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
             categories=categories,
             flagStatus=flagStatus,
             inferenceClassification=inferenceClassification,
+            receivedAfter=receivedAfter,
+            receivedBefore=receivedBefore,
+            order=order,
+            cursor=cursor,
         )
 
     @mcp.tool(
         name="mail_check_inbox",
         description=(
             "Quickly check an inbox or shared inbox folder. Defaults to unread "
-            "messages in Inbox and includes triage metadata."
+            "messages in Inbox, newest first, and includes triage metadata."
         ),
     )
     async def mail_check_inbox(
@@ -743,16 +758,56 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
     @mcp.tool(
         name="mail_get",
         description=(
-            "Get the full details and body of one message by ID. Use mailbox for "
-            "shared/delegated mailboxes."
+            "Get the details and body of one message by ID. By default the body "
+            "is plain text and only the part new to this message (no quoted "
+            "thread), which is far smaller than the raw HTML; message.bodyScope "
+            "says whether the new part or the full body came back. Forwards "
+            "(FW:/Fwd:) always get the full body so the forwarded message is "
+            "kept. The new part can miss answers typed inline into quoted "
+            "text; if the new part refers to answers inline or below, read "
+            'again with bodyScope="full". bodyFormat="html" returns the '
+            "original HTML (needed to match cid: inline images). Use "
+            "mail_get_messages to read several messages in one call. Use "
+            "mailbox for shared/delegated mailboxes."
         ),
     )
     async def mail_get(
         messageId: str,
         mailbox: str | None = None,
+        bodyFormat: Literal["text", "html"] = "text",
+        bodyScope: Literal["new", "full"] = "new",
     ) -> MailGetResult:
         runtime = runtime_provider.get()
-        return await runtime.graph.get_message(mailbox=mailbox, messageId=messageId)
+        return await runtime.graph.get_message(
+            mailbox=mailbox,
+            messageId=messageId,
+            bodyFormat=bodyFormat,
+            bodyScope=bodyScope,
+        )
+
+    @mcp.tool(
+        name="mail_get_messages",
+        description=(
+            "Get several messages by ID in one call (up to 50), with the same "
+            "bodyFormat/bodyScope options and defaults as mail_get. Results keep "
+            "the input order; a message that cannot be read carries an error "
+            "instead of failing the call. Use mailbox for shared/delegated "
+            "mailboxes."
+        ),
+    )
+    async def mail_get_messages(
+        messageIds: list[str],
+        mailbox: str | None = None,
+        bodyFormat: Literal["text", "html"] = "text",
+        bodyScope: Literal["new", "full"] = "new",
+    ) -> MailGetMessagesResult:
+        runtime = runtime_provider.get()
+        return await runtime.graph.get_messages(
+            mailbox=mailbox,
+            messageIds=messageIds,
+            bodyFormat=bodyFormat,
+            bodyScope=bodyScope,
+        )
 
     @mcp.tool(
         name="mail_list_drafts",
@@ -940,8 +995,10 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
         description=(
             "View the pictures embedded in a message body. Returns each inline "
             "image as image content, keyed by the contentId that the HTML body "
-            "references as cid:. Set includeNonInline to also pull regular "
-            "image attachments."
+            "references as cid:. To see where each image sits, read the body "
+            'with mail_get bodyFormat="html" and bodyScope="full"; the default '
+            "plain-text body has no cid: references. Set includeNonInline to "
+            "also pull regular image attachments."
         ),
         structured_output=False,
     )
@@ -1002,7 +1059,12 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
     @mcp.tool(
         name="mail_get_thread",
         description=(
-            "Get messages in the same conversation by messageId or conversationId."
+            "Get message summaries in the same conversation by messageId or "
+            "conversationId, including sent replies. Returns the newest `top` "
+            "(max 100) messages newest first by default; order=\"oldest\" "
+            "returns the oldest `top` oldest first. truncated is true when the "
+            "thread has more messages; messageCount is the thread size, or null "
+            "when truncated. Read bodies with mail_get_messages."
         ),
     )
     async def mail_get_thread(
@@ -1010,6 +1072,7 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
         conversationId: str | None = None,
         mailbox: str | None = None,
         top: int = 50,
+        order: Literal["newest", "oldest"] = "newest",
     ) -> MailThreadResult:
         runtime = runtime_provider.get()
         return await runtime.graph.get_thread(
@@ -1017,6 +1080,7 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
             messageId=messageId,
             conversationId=conversationId,
             top=top,
+            order=order,
         )
 
     @mcp.tool(

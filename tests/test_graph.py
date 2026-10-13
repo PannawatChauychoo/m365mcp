@@ -2569,3 +2569,124 @@ async def test_workbook_attachment_reads_workbooks_with_svg_images() -> None:
     assert result.ranges[0].values == [["Label 1"]]
 
     await client.aclose()
+
+
+def _workbook_with_sheets(count: int) -> bytes:
+    import io
+
+    import openpyxl
+
+    book = openpyxl.Workbook()
+    book.active.title = "S0"
+    book.active["A1"] = "aaaa"
+    for index in range(1, count):
+        book.create_sheet(f"S{index}")["A1"] = "aaaa"
+    buffer = io.BytesIO()
+    book.save(buffer)
+    return buffer.getvalue()
+
+
+_READ_DEFAULTS = {
+    "sheet": None,
+    "includeFormulas": False,
+    "includeNumberFormat": False,
+    "includeLayout": False,
+    "includeDefinedNames": False,
+    "maxCells": 1000,
+}
+
+
+def _ticking_clock(
+    monkeypatch: pytest.MonkeyPatch, scans: list[str], seconds_per_scan: float
+) -> None:
+    """A fake clock that only moves when a sheet's extent is measured."""
+    now = [0.0]
+    real_extent = workbook_reader._worksheet_extent
+
+    def extent(worksheet):
+        scans.append(worksheet.title)
+        now[0] += seconds_per_scan
+        return real_extent(worksheet)
+
+    monkeypatch.setattr(workbook_reader, "monotonic", lambda: now[0])
+    monkeypatch.setattr(workbook_reader, "_worksheet_extent", extent)
+
+
+def test_workbook_layout_stops_measuring_sheets_at_the_time_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scans: list[str] = []
+    _ticking_clock(monkeypatch, scans, 31.0)
+
+    result = workbook_reader.read_workbook(
+        _workbook_with_sheets(4), ranges=None, **{**_READ_DEFAULTS, "includeLayout": True}
+    )
+
+    # The first scan passes the 30 s limit, so no second one starts.
+    assert scans == ["S0"]
+    assert [sheet.name for sheet in result.sheets] == ["S0"]
+    assert result.truncated is True
+
+
+def test_workbook_ranges_past_the_time_limit_do_not_measure_sheets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    scans: list[str] = []
+    _ticking_clock(monkeypatch, scans, 20.0)
+
+    result = workbook_reader.read_workbook(
+        _workbook_with_sheets(4),
+        ranges=["S0!A:A", "S1!A:A", "'S2'!A:A"],
+        **_READ_DEFAULTS,
+    )
+
+    # S0 is measured and read at 20 s; measuring S1 passes the limit, and
+    # S2 is refused without being measured.
+    assert scans == ["S0", "S1"]
+    first, *later = result.ranges
+    assert first.values == [["aaaa"]]
+    for data, sheet in zip(later, ["S1", "S2"]):
+        assert data.worksheet == sheet
+        assert "read time limit is used up" in data.error
+    # S2 was never resolved, so it keeps the address as requested.
+    assert later[1].address == "A:A"
+
+
+def test_workbook_text_limit_in_a_later_pass_keeps_the_values(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import io
+
+    import openpyxl
+
+    book = openpyxl.Workbook()
+    book.active.title = "Sheet"
+    for row in range(1, 4):
+        book.active.cell(row, 1, "aaaa")
+    buffer = io.BytesIO()
+    book.save(buffer)
+    # "Sheet" (5) + three 4-character values (12) fit; the first number
+    # format ("General", 7) does not.
+    monkeypatch.setattr(workbook_reader, "MAX_WORKBOOK_TOTAL_CHARS", 20)
+
+    result = workbook_reader.read_workbook(
+        buffer.getvalue(),
+        ranges=["A1:A3"],
+        **{**_READ_DEFAULTS, "includeNumberFormat": True},
+    )
+
+    (data,) = result.ranges
+    assert data.error is None
+    assert data.values == [["aaaa"], ["aaaa"], ["aaaa"]]
+    assert data.numberFormat is None
+    assert data.truncated is True
+
+
+@pytest.mark.parametrize("request_text", ["", "  ", "Sheet!", "'Sheet'!$"])
+def test_workbook_empty_address_is_an_error(request_text: str) -> None:
+    result = workbook_reader.read_workbook(
+        _workbook_with_sheets(1), ranges=[request_text], **_READ_DEFAULTS
+    )
+    (data,) = result.ranges
+    assert data.values is None or data.values == []
+    assert "names no cells" in (data.error or "")

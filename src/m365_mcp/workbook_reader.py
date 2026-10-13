@@ -287,7 +287,9 @@ def _read(
     if includeLayout:
         for worksheet in book.worksheets:
             budget.charge(worksheet.title)
-            if budget.exhausted:
+            # Each extent is a scan of the whole sheet; stop starting them
+            # once the call's time limit has passed.
+            if budget.exhausted or budget.out_of_time:
                 truncated = True
                 break
             extent = extent_of(worksheet.title)
@@ -368,6 +370,21 @@ def _read_range(
     """Read one range within the remaining cell and text budgets; return it
     and the number of cells it used."""
 
+    # Resolving a whole-sheet, row, or column request can scan the sheet, so
+    # the time limit is checked before it, not only before the reads.
+    if budget.out_of_time:
+        return (
+            AttachmentRangeData(
+                worksheet=_requested_sheet(request) or default_sheet or "",
+                address=_requested_address(request),
+                truncated=True,
+                error=(
+                    f"The {WORKBOOK_READ_MAX_SECONDS:g}-second read time limit is "
+                    "used up; request this range in another call"
+                ),
+            ),
+            0,
+        )
     worksheet_name, bounds, used_extent = _resolve_range(
         books.values, request, default_sheet=default_sheet, extent_of=extent_of
     )
@@ -440,27 +457,35 @@ def _read_range(
         return _cell_value(cell.value)
 
     cut_before = budget.cut_cells
-    grids: list[list[list[Any]]] = []
-    readers: list[tuple[Any, Callable[[Any], Any]]] = [(books.values, value)]
+    grids: dict[str, list[list[Any]]] = {}
+    readers: list[tuple[str, Any, Callable[[Any], Any]]] = [("values", books.values, value)]
     if includeFormulas:
-        readers.append((books.formulas, value))
+        readers.append(("formulas", books.formulas, value))
     if includeNumberFormat:
-        readers.append((books.values, lambda cell: getattr(cell, "number_format", None)))
-    for book, read in readers:
+        readers.append(
+            ("numberFormat", books.values, lambda cell: getattr(cell, "number_format", None))
+        )
+    for kind, book, read in readers:
         rows = grid(book, read, row_count) if not budget.out_of_time else []
+        if grids and not rows:
+            # Out of text or time before this pass read a row: keep the rows
+            # already read and leave this grid and the later ones out,
+            # rather than discarding everything.
+            range_truncated = True
+            break
         if len(rows) < row_count:
             # The text or time budget ran out; keep every grid the same height.
             row_count = len(rows)
             range_truncated = True
-            grids = [earlier[:row_count] for earlier in grids]
-        grids.append(rows)
+            grids = {name: earlier[:row_count] for name, earlier in grids.items()}
+        grids[kind] = rows
         if row_count == 0:
             if budget.out_of_time:
                 return used_up(f"The {WORKBOOK_READ_MAX_SECONDS:g}-second read time limit")
             return used_up(f"The {MAX_WORKBOOK_TOTAL_CHARS}-character text limit")
-    values, *rest = grids
-    formulas = rest.pop(0) if includeFormulas else None
-    number_format = rest.pop(0) if includeNumberFormat else None
+    values = grids["values"]
+    formulas = grids.get("formulas")
+    number_format = grids.get("numberFormat")
     # A cell whose text was cut also marks the range truncated.
     range_truncated = range_truncated or budget.cut_cells > cut_before
 
@@ -608,7 +633,11 @@ def _resolve_range(
         else:
             address = text
         address = address.replace("$", "").strip()
-        if address and not _is_a1_reference(address):
+        if not address:
+            raise WorkbookReadError(
+                f"'{request}' names no cells; omit ranges to read the whole sheet"
+            )
+        if not _is_a1_reference(address):
             # 'Sheet'!Name means a name scoped to that sheet, as in Excel.
             sheet_name, address = _resolve_defined_name(
                 book, address, scope_sheet=sheet_name or default_sheet

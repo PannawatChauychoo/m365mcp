@@ -1016,9 +1016,10 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
             "what Excel saved with the file — nothing is "
             "recalculated, so a formula never calculated in Excel reads as "
             "null. One call takes at most 20 ranges and returns at most "
-            "maxCells cells (capped at 50,000) and about 200,000 characters of "
-            "text (a cell's text is cut at 2,000); truncated: true means "
-            "request the rest in another call. "
+            "maxCells cells (capped at 50,000) and about 200,000 characters "
+            "(cells, names, and sheet names; a cell's text is cut at 2,000), "
+            "and stops starting new reads after 30 seconds; truncated: true "
+            "means request the rest in another call. "
             "Attachments over maxBytes (capped at 25 MB) are refused."
         ),
     )

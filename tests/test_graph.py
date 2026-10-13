@@ -2390,3 +2390,180 @@ async def test_workbook_attachment_refuses_utf16_dtd() -> None:
     result = await graph.get_attachment_workbook(messageId="msg-1", attachmentId="xl-1")
     assert "document type declaration" in result.unsupportedReason
     await client.aclose()
+
+
+def _build_ten_rows(workbook) -> None:
+    from openpyxl.workbook.defined_name import DefinedName
+
+    sheet = workbook.active
+    sheet.title = "Assump"
+    for row in range(1, 11):
+        sheet.cell(row=row, column=1, value=f"Label {row}")
+        sheet.cell(row=row, column=2, value=row * 100)
+    names = workbook.defined_names
+    names["PurchasePrice"] = DefinedName("PurchasePrice", attr_text="Assump!$B$2")
+    # What Excel leaves behind when a name's cells are deleted.
+    names["Deleted"] = DefinedName("Deleted", attr_text="Assump!#REF!")
+    names["Constant"] = DefinedName("Constant", attr_text='"' + "x" * 5_000 + '"')
+
+
+@pytest.mark.anyio
+async def test_workbook_attachment_refuses_deleted_cell_names() -> None:
+    client, graph = _workbook_graph(_xlsx_bytes(_build_ten_rows))
+
+    result = await graph.get_attachment_workbook(
+        messageId="msg-1",
+        attachmentId="xl-1",
+        ranges=["Deleted", "Assump!Deleted", "PurchasePrice"],
+    )
+
+    deleted, scoped, price = result.ranges
+    for refused in (deleted, scoped):
+        assert refused.values is None
+        assert "#REF!" in refused.error and "deleted" in refused.error
+    # The error is labelled with the sheet the request named.
+    assert deleted.worksheet == ""
+    assert scoped.worksheet == "Assump"
+    assert price.values == [[200]]
+
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_workbook_attachment_refuses_row_zero() -> None:
+    client, graph = _workbook_graph(_xlsx_bytes(_build_ten_rows))
+
+    result = await graph.get_attachment_workbook(
+        messageId="msg-1",
+        attachmentId="xl-1",
+        ranges=["A0:B2", "A0", "0:2", "Assump!B0", "A1:B2"],
+    )
+
+    *refused, read = result.ranges
+    for data in refused:
+        assert data.values is None
+        assert "rows and columns start at 1" in data.error
+    assert refused[3].worksheet == "Assump"
+    assert read.address == "A1:B2"
+    assert read.values == [["Label 1", 100], ["Label 2", 200]]
+
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_workbook_attachment_cuts_defined_name_targets_in_errors() -> None:
+    client, graph = _workbook_graph(_xlsx_bytes(_build_ten_rows))
+
+    result = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", ranges=["Constant"] * 20
+    )
+
+    for data in result.ranges:
+        assert "not a single cell range" in data.error
+        assert len(data.error) < 400
+    assert len(result.model_dump_json()) < 20 * 500
+
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_workbook_attachment_text_limit_covers_names_sheets_and_numbers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from m365_mcp import workbook_reader
+
+    monkeypatch.setattr(workbook_reader, "MAX_WORKBOOK_TOTAL_CHARS", 1_000)
+
+    def build(workbook) -> None:
+        from openpyxl.workbook.defined_name import DefinedName
+
+        first = workbook.active
+        first.title = "Numbers"
+        for row in range(1, 201):
+            first.cell(row=row, column=1, value=1_234_567_890 + row)
+        for index in range(40):
+            workbook.create_sheet(f"Sheet with a long name {index:03d}")
+        for index in range(100):
+            name = f"Input_{index:03d}_" + "n" * 30
+            workbook.defined_names[name] = DefinedName(name, attr_text="Numbers!$A$1")
+
+    client, graph = _workbook_graph(_xlsx_bytes(build))
+
+    names = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", includeDefinedNames=True
+    )
+    assert names.definedNameCount == 100
+    assert 0 < len(names.definedNames) < 100
+    assert names.truncated is True
+
+    layout = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", includeLayout=True, ranges=["Numbers!A1"]
+    )
+    assert 0 < len(layout.sheets) < 41
+    assert layout.truncated is True
+
+    numbers = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", ranges=["Numbers!A1:A200"]
+    )
+    (read,) = numbers.ranges
+    # Ten-digit numbers: about 1,000 characters' worth, not all 200 rows.
+    assert 0 < read.rowCount < 120
+    assert read.truncated is True
+
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_workbook_attachment_stops_at_the_read_time_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from m365_mcp import workbook_reader
+
+    monkeypatch.setattr(workbook_reader, "WORKBOOK_READ_MAX_SECONDS", -1.0)
+    client, graph = _workbook_graph(_xlsx_bytes(_build_ten_rows))
+
+    result = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", ranges=["A1:B2", "A3:B4"]
+    )
+
+    assert result.truncated is True
+    for data in result.ranges:
+        assert "read time limit is used up" in data.error
+
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_workbook_attachment_allows_graph_size_overhead() -> None:
+    payload = _xlsx_bytes(_build_ten_rows)
+    # Graph's size counts item properties too, so it can exceed the file.
+    client, graph = _workbook_graph(payload, size=len(payload) + 2_000)
+
+    result = await graph.get_attachment_workbook(
+        messageId="msg-1",
+        attachmentId="xl-1",
+        ranges=["A1"],
+        maxBytes=len(payload) + 10,
+    )
+
+    assert result.unsupportedReason is None
+    assert result.ranges[0].values == [["Label 1"]]
+
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_workbook_attachment_reads_workbooks_with_svg_images() -> None:
+    from tests.test_zip_guard import SVG_WITH_DOCTYPE
+
+    base = _xlsx_bytes(_build_ten_rows)
+    client, graph = _workbook_graph(_rezip(base, {"xl/media/image1.svg": SVG_WITH_DOCTYPE}))
+
+    result = await graph.get_attachment_workbook(
+        messageId="msg-1", attachmentId="xl-1", ranges=["A1"]
+    )
+
+    assert result.unsupportedReason is None
+    assert result.ranges[0].values == [["Label 1"]]
+
+    await client.aclose()

@@ -206,6 +206,10 @@ DEFAULT_MAX_PDF_PAGES = 5
 DEFAULT_PDF_MAX_BYTES = 25_000_000
 # Metadata only: contentBytes is left out so the download can be size-checked.
 WORKBOOK_ATTACHMENT_SELECT = "id,name,contentType,size,isInline,lastModifiedDateTime"
+# Graph's attachment size counts the item's properties as well as the file,
+# so the up-front refusal allows this much over maxBytes; the streamed
+# download still stops at exactly maxBytes.
+ATTACHMENT_SIZE_HEADROOM_BYTES = 64 * 1024
 SAFE_ATTACHMENT_EXTENSIONS = {
     ".csv",
     ".ics",
@@ -1127,7 +1131,10 @@ class MicrosoftGraphClient:
         reason = workbook_reader.unavailable_reason()
         if reason is not None:
             return unsupported(reason)
-        if attachment.size is not None and attachment.size > maxBytes:
+        if (
+            attachment.size is not None
+            and attachment.size > maxBytes + ATTACHMENT_SIZE_HEADROOM_BYTES
+        ):
             return unsupported(f"Workbook size exceeds maxBytes={maxBytes}")
 
         content_bytes = await self._request_bytes_limited(

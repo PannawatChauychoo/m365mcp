@@ -75,6 +75,12 @@ MAX_WORKBOOK_RANGES = 20
 # extent is reported as incomplete.
 WORKBOOK_EXTENT_MAX_CELLS = 5_000_000
 WORKBOOK_EXTENT_MAX_SECONDS = 10.0
+# Each range is read in up to three passes (values, formulas, number formats)
+# from the top of the sheet, and the worker thread cannot be cancelled, so a
+# call stops starting new passes after this long and marks the rest truncated.
+WORKBOOK_READ_MAX_SECONDS = 30.0
+# A defined name's target echoed in an error message is cut to this length.
+MAX_WORKBOOK_ERROR_ECHO_CHARS = 200
 WORKBOOK_ERROR_VALUE = re.compile(r"#(?:N/A|REF!|NAME\?|VALUE!|DIV/0!|NULL!|NUM!)")
 # A bracketed workbook before a sheet reference ([1]Proforma!C4); structured
 # table references like Table1[Rent] have no "!" and are kept.
@@ -89,14 +95,24 @@ class WorkbookReadError(RuntimeError):
 
 
 class _TextBudget:
-    """Characters of text one call may still return."""
+    """Characters one call may still return, and when it must stop reading.
+
+    Every string that reaches the response is charged: cell text, formulas,
+    number formats, defined names and their targets, and sheet names. Numbers
+    and booleans are charged their printed length; empty cells are bounded by
+    maxCells instead."""
 
     def __init__(self, total: int) -> None:
         self.remaining = total
         self.cut_cells = 0
+        self.deadline = monotonic() + WORKBOOK_READ_MAX_SECONDS
 
     def take(self, value: Any) -> Any:
+        """Charge a cell value, cutting long text."""
+        if value is None:
+            return value
         if not isinstance(value, str):
+            self.remaining -= len(str(value))
             return value
         if len(value) > MAX_WORKBOOK_CELL_CHARS:
             value = value[:MAX_WORKBOOK_CELL_CHARS] + WORKBOOK_TEXT_CUT_MARKER
@@ -104,9 +120,17 @@ class _TextBudget:
         self.remaining -= len(value)
         return value
 
+    def charge(self, text: str | None) -> None:
+        """Charge an identifier (sheet or name) that must come back whole."""
+        self.remaining -= len(text or "")
+
     @property
     def exhausted(self) -> bool:
         return self.remaining < 0
+
+    @property
+    def out_of_time(self) -> bool:
+        return monotonic() > self.deadline
 
 
 class WorkbookRead(NamedTuple):
@@ -252,11 +276,20 @@ def _read(
         name_count = len(usable_names)
         if includeDefinedNames:
             truncated = name_count > MAX_WORKBOOK_DEFINED_NAMES
-            defined_names = usable_names[:MAX_WORKBOOK_DEFINED_NAMES]
-            for defined_name in defined_names:
+            for defined_name in usable_names[:MAX_WORKBOOK_DEFINED_NAMES]:
+                budget.charge(defined_name.name)
+                budget.charge(defined_name.scope)
                 defined_name.value = budget.take(defined_name.value)
+                if budget.exhausted:
+                    truncated = True
+                    break
+                defined_names.append(defined_name)
     if includeLayout:
         for worksheet in book.worksheets:
+            budget.charge(worksheet.title)
+            if budget.exhausted:
+                truncated = True
+                break
             extent = extent_of(worksheet.title)
             sheets.append(
                 WorkbookSheetInfo(
@@ -299,7 +332,9 @@ def _read(
             )
             data, used = (
                 AttachmentRangeData(
-                    worksheet=sheet or "", address=request or "", error=message
+                    worksheet=_requested_sheet(request) or sheet or "",
+                    address=request or "",
+                    error=message,
                 ),
                 0,
             )
@@ -363,6 +398,7 @@ def _read_range(
             0,
         )
 
+    budget.charge(worksheet_name)
     min_col, min_row, max_col, max_row = bounds
     column_count = max_col - min_col + 1
     row_count = max_row - min_row + 1
@@ -375,6 +411,8 @@ def _read_range(
         range_truncated = True
     if budget.remaining <= 0:
         return used_up(f"The {MAX_WORKBOOK_TOTAL_CHARS}-character text limit")
+    if budget.out_of_time:
+        return used_up(f"The {WORKBOOK_READ_MAX_SECONDS:g}-second read time limit")
 
     def grid(book: Any, read: Callable[[Any], Any], rows_wanted: int) -> list[list[Any]]:
         """Read up to ``rows_wanted`` rows, stopping before the row that
@@ -389,7 +427,7 @@ def _read_range(
             if len(rows) == rows_wanted:
                 break
             cells = [budget.take(read(cell)) for cell in row][:column_count]
-            if budget.exhausted:
+            if budget.exhausted or budget.out_of_time:
                 return rows
             cells.extend([None] * (column_count - len(cells)))
             rows.append(cells)
@@ -409,14 +447,16 @@ def _read_range(
     if includeNumberFormat:
         readers.append((books.values, lambda cell: getattr(cell, "number_format", None)))
     for book, read in readers:
-        rows = grid(book, read, row_count)
+        rows = grid(book, read, row_count) if not budget.out_of_time else []
         if len(rows) < row_count:
-            # The text budget ran out; keep every grid the same height.
+            # The text or time budget ran out; keep every grid the same height.
             row_count = len(rows)
             range_truncated = True
             grids = [earlier[:row_count] for earlier in grids]
         grids.append(rows)
         if row_count == 0:
+            if budget.out_of_time:
+                return used_up(f"The {WORKBOOK_READ_MAX_SECONDS:g}-second read time limit")
             return used_up(f"The {MAX_WORKBOOK_TOTAL_CHARS}-character text limit")
     values, *rest = grids
     formulas = rest.pop(0) if includeFormulas else None
@@ -584,6 +624,11 @@ def _resolve_range(
         raise WorkbookReadError(
             f"'{request}' is not an A1 address or defined name"
         ) from error
+    # openpyxl parses A0 as row 0; iter_rows would read row 1 under that label.
+    if any(bound is not None and bound < 1 for bound in (min_col, min_row, max_col, max_row)):
+        raise WorkbookReadError(
+            f"'{request}' is not a valid address; rows and columns start at 1"
+        )
     used_extent = None in (min_col, min_row, max_col, max_row)
     if used_extent:
         extent = extent_of(worksheet_name)
@@ -647,14 +692,38 @@ def _resolve_defined_name(
             # openpyxl cannot parse some targets, e.g. structured table
             # references like Rents[Rent].
             destinations = []
+        target = _echo(defined_name.value)
         if len(destinations) != 1:
             raise WorkbookReadError(
-                f"Defined name '{name}' refers to '{defined_name.value}', which "
+                f"Defined name '{name}' refers to '{target}', which "
                 "is not a single cell range this tool can read"
             )
         sheet_name, address = destinations[0]
-        return sheet_name.replace("''", "'"), address.replace("$", "")
+        address = address.replace("$", "").strip()
+        # openpyxl reads Sheet!#REF! as that sheet with an empty address, which
+        # would otherwise mean "the whole used range".
+        if not address or "#" in address:
+            raise WorkbookReadError(
+                f"Defined name '{name}' refers to '{target}', whose cells were "
+                "deleted (#REF!)"
+            )
+        return sheet_name.replace("''", "'"), address
     raise WorkbookReadError(f"'{name}' is not an A1 address or defined name")
+
+
+def _echo(text: str | None) -> str:
+    """Cut workbook text quoted in an error message."""
+    text = text or ""
+    if len(text) <= MAX_WORKBOOK_ERROR_ECHO_CHARS:
+        return text
+    return text[:MAX_WORKBOOK_ERROR_ECHO_CHARS] + WORKBOOK_TEXT_CUT_MARKER
+
+
+def _requested_sheet(request: str | None) -> str | None:
+    """The sheet named in a ``Sheet!A1`` request, for labelling its error."""
+    if request is None or "!" not in request:
+        return None
+    return _unquote_sheet_name(request.strip().rpartition("!")[0]) or None
 
 
 def _unquote_sheet_name(sheet_part: str) -> str:

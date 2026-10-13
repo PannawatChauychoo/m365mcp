@@ -57,6 +57,9 @@ from m365_mcp.workbook_reader import (
     DEFAULT_WORKBOOK_MAX_CELLS,
 )
 from m365_mcp.sharepoint_files import (
+    DEFAULT_FILE_MAX_BYTES,
+    DEFAULT_FILE_MAX_CHARS,
+    DriveItemContentResult,
     DriveItemInfo,
     DriveItemsResult,
     DrivesResult,
@@ -91,6 +94,7 @@ from m365_mcp.models import (
     MailCreateDraftResult,
     MailFolderMutationResult,
     MailFolderTreeResult,
+    MailGetMessagesResult,
     MailGetResult,
     MailInlineImagesResult,
     MailListAttachmentsResult,
@@ -245,14 +249,7 @@ class _HelperServerRunner:
 
     async def run(self, *, task_status: anyio.abc.TaskStatus[None]) -> None:
         if not _can_bind_localhost(self._runtime.config.port):
-            print(
-                "Claude M365 MCP local helper was not started because "
-                f"localhost:{self._runtime.config.port} is already in use. "
-                "Close the other process using that port, or set PORT and "
-                "LOCAL_BASE_URL to a different localhost port that also matches "
-                "the Azure redirect URI.",
-                file=sys.stderr,
-            )
+            self._report_port_in_use()
             task_status.started()
             return
 
@@ -297,8 +294,29 @@ class _HelperServerRunner:
             task_group.start_soon(wait_until_started)
             try:
                 await server.serve()
+            except (SystemExit, OSError):
+                # Another copy can take the port between the check above and
+                # the bind (Claude Desktop starts two at once). uvicorn reports
+                # a failed bind with sys.exit(1); keep the MCP server running.
+                # Anything else, including a failure while the port is still
+                # free, is a real error and is not hidden.
+                if server.started or _can_bind_localhost(self._runtime.config.port):
+                    raise
+                self._server = None
+                self._report_port_in_use()
+                task_status.started()
             finally:
                 task_group.cancel_scope.cancel()
+
+    def _report_port_in_use(self) -> None:
+        print(
+            "Claude M365 MCP local helper was not started because "
+            f"localhost:{self._runtime.config.port} is already in use. "
+            "Close the other process using that port, or set PORT and "
+            "LOCAL_BASE_URL to a different localhost port that also matches "
+            "the Azure redirect URI.",
+            file=sys.stderr,
+        )
 
     async def stop(self) -> None:
         if self._server is not None:
@@ -444,8 +462,14 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
     @mcp.tool(
         name="mail_list",
         description=(
-            "List messages from a mailbox folder. Use mailbox for shared/delegated "
-            "mailboxes the signed-in Microsoft user can access."
+            "List messages from a mailbox folder, newest first by default "
+            '(order="oldest" reverses). receivedAfter (inclusive) and '
+            "receivedBefore (exclusive) take ISO 8601 dates or date-times, read "
+            "as UTC unless an offset is given, and combine with the other "
+            "filters, including inferenceClassification for Focused/Other. "
+            "When hasMore is true, call again with the same arguments and "
+            "cursor=nextCursor for the next page. Use mailbox for "
+            "shared/delegated mailboxes the signed-in Microsoft user can access."
         ),
     )
     async def mail_list(
@@ -460,6 +484,10 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
         categories: list[str] | None = None,
         flagStatus: Literal["notFlagged", "flagged", "complete"] | None = None,
         inferenceClassification: Literal["focused", "other"] | None = None,
+        receivedAfter: str | None = None,
+        receivedBefore: str | None = None,
+        order: Literal["newest", "oldest"] = "newest",
+        cursor: str | None = None,
     ) -> MailListResult:
         runtime = runtime_provider.get()
         return await runtime.graph.list_messages(
@@ -474,13 +502,17 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
             categories=categories,
             flagStatus=flagStatus,
             inferenceClassification=inferenceClassification,
+            receivedAfter=receivedAfter,
+            receivedBefore=receivedBefore,
+            order=order,
+            cursor=cursor,
         )
 
     @mcp.tool(
         name="mail_check_inbox",
         description=(
             "Quickly check an inbox or shared inbox folder. Defaults to unread "
-            "messages in Inbox and includes triage metadata."
+            "messages in Inbox, newest first, and includes triage metadata."
         ),
     )
     async def mail_check_inbox(
@@ -748,16 +780,56 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
     @mcp.tool(
         name="mail_get",
         description=(
-            "Get the full details and body of one message by ID. Use mailbox for "
-            "shared/delegated mailboxes."
+            "Get the details and body of one message by ID. By default the body "
+            "is plain text and only the part new to this message (no quoted "
+            "thread), which is far smaller than the raw HTML; message.bodyScope "
+            "says whether the new part or the full body came back. Forwards "
+            "(FW:/Fwd:) always get the full body so the forwarded message is "
+            "kept. The new part can miss answers typed inline into quoted "
+            "text; if the new part refers to answers inline or below, read "
+            'again with bodyScope="full". bodyFormat="html" returns the '
+            "original HTML (needed to match cid: inline images). Use "
+            "mail_get_messages to read several messages in one call. Use "
+            "mailbox for shared/delegated mailboxes."
         ),
     )
     async def mail_get(
         messageId: str,
         mailbox: str | None = None,
+        bodyFormat: Literal["text", "html"] = "text",
+        bodyScope: Literal["new", "full"] = "new",
     ) -> MailGetResult:
         runtime = runtime_provider.get()
-        return await runtime.graph.get_message(mailbox=mailbox, messageId=messageId)
+        return await runtime.graph.get_message(
+            mailbox=mailbox,
+            messageId=messageId,
+            bodyFormat=bodyFormat,
+            bodyScope=bodyScope,
+        )
+
+    @mcp.tool(
+        name="mail_get_messages",
+        description=(
+            "Get several messages by ID in one call (up to 50), with the same "
+            "bodyFormat/bodyScope options and defaults as mail_get. Results keep "
+            "the input order; a message that cannot be read carries an error "
+            "instead of failing the call. Use mailbox for shared/delegated "
+            "mailboxes."
+        ),
+    )
+    async def mail_get_messages(
+        messageIds: list[str],
+        mailbox: str | None = None,
+        bodyFormat: Literal["text", "html"] = "text",
+        bodyScope: Literal["new", "full"] = "new",
+    ) -> MailGetMessagesResult:
+        runtime = runtime_provider.get()
+        return await runtime.graph.get_messages(
+            mailbox=mailbox,
+            messageIds=messageIds,
+            bodyFormat=bodyFormat,
+            bodyScope=bodyScope,
+        )
 
     @mcp.tool(
         name="mail_list_drafts",
@@ -945,8 +1017,10 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
         description=(
             "View the pictures embedded in a message body. Returns each inline "
             "image as image content, keyed by the contentId that the HTML body "
-            "references as cid:. Set includeNonInline to also pull regular "
-            "image attachments."
+            "references as cid:. To see where each image sits, read the body "
+            'with mail_get bodyFormat="html" and bodyScope="full"; the default '
+            "plain-text body has no cid: references. Set includeNonInline to "
+            "also pull regular image attachments."
         ),
         structured_output=False,
     )
@@ -1054,7 +1128,12 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
     @mcp.tool(
         name="mail_get_thread",
         description=(
-            "Get messages in the same conversation by messageId or conversationId."
+            "Get message summaries in the same conversation by messageId or "
+            "conversationId, including sent replies. Returns the newest `top` "
+            "(max 100) messages newest first by default; order=\"oldest\" "
+            "returns the oldest `top` oldest first. truncated is true when the "
+            "thread has more messages; messageCount is the thread size, or null "
+            "when truncated. Read bodies with mail_get_messages."
         ),
     )
     async def mail_get_thread(
@@ -1062,6 +1141,7 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
         conversationId: str | None = None,
         mailbox: str | None = None,
         top: int = 50,
+        order: Literal["newest", "oldest"] = "newest",
     ) -> MailThreadResult:
         runtime = runtime_provider.get()
         return await runtime.graph.get_thread(
@@ -1069,6 +1149,7 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
             messageId=messageId,
             conversationId=conversationId,
             top=top,
+            order=order,
         )
 
     @mcp.tool(
@@ -1744,6 +1825,31 @@ def _create_server(runtime_provider: _RuntimeProvider) -> FastMCP:
     ) -> DriveItemInfo:
         runtime = runtime_provider.get()
         return await runtime.sharepoint.get_item_by_share_url(shareUrl=shareUrl)
+
+    @mcp.tool(
+        name="sharepoint_get_file_content",
+        description=(
+            "Read a Word (.docx, .docm, .dotx, .dotm), PDF, or text (.md, .txt, "
+            ".csv, .json, ...) file from SharePoint or OneDrive by driveId and "
+            "itemId. Word comes back as Markdown (headings, lists, tables), PDF "
+            "as its text layer per page, and text files as-is. maxBytes is capped "
+            "at 50 MB and maxChars at 500,000. Excel files use the workbook "
+            "tools; other types return unsupportedReason. Nothing is saved to disk."
+        ),
+    )
+    async def sharepoint_get_file_content(
+        driveId: str,
+        itemId: str,
+        maxBytes: int = DEFAULT_FILE_MAX_BYTES,
+        maxChars: int = DEFAULT_FILE_MAX_CHARS,
+    ) -> DriveItemContentResult:
+        runtime = runtime_provider.get()
+        return await runtime.sharepoint.get_file_content(
+            driveId=driveId,
+            itemId=itemId,
+            maxBytes=maxBytes,
+            maxChars=maxChars,
+        )
 
     @mcp.tool(
         name="sharepoint_list_permissions",

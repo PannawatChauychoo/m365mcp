@@ -23,7 +23,16 @@ This MCP server gives Claude local delegated access to one Microsoft 365 account
 
 - Message summaries include read state, attachment presence, importance, categories, flag status, Focused/Other inference classification, parent folder ID, sender, reply-to, internet message ID, and conversation ID.
 - `inferenceClassification` is a Microsoft Graph message property for Focused Inbox, not a separate app-registration permission.
+- `mail_list` returns the newest messages first. Use `order="oldest"` to start from the oldest.
+- Narrow `mail_list` by date with `receivedAfter` (inclusive) and `receivedBefore` (exclusive). Both take an ISO 8601 date such as `2026-10-01` or a date-time such as `2026-10-01T09:00:00-05:00` (fractional seconds are kept). A value without an offset is read as UTC, so give the user's offset when the exact day boundary matters. Date filters combine with every other filter, including `inferenceClassification`, so "Focused mail from last week" is one call.
+- `mail_list` pages with an opaque cursor. When a result has `hasMore: true`, call again with the same arguments and `cursor` set to `nextCursor`. A cursor is rejected if the mailbox, folder, filters, or order differ from the call that returned it; `top` may change. Mail that arrives between calls can shift a newest-first page by a message or two, so fix `receivedBefore` when paging through a busy folder.
+- `mail_check_inbox` also returns the newest messages first.
 - Prefer `mail_check_inbox` or `mail_list` filters for quick triage. `mail_search` delegates to Microsoft Graph `$search`, which can be slower on large mailboxes.
+- `mail_get` returns a plain-text body containing only the part new to that message by default (Microsoft Graph `uniqueBody`), so a reply no longer drags its HTML, signature styling, and quoted thread along. `message.bodyScope` is `"new"` when that worked and `"full"` when Graph had no separate new part and the whole body came back instead.
+- Forwards (subjects starting `FW:`/`Fwd:`, `WG:`, `TR:`, `RV:`, `VB:` or `VS:`, also after `RE:` or a `[tag]`) come back with the full body, because the forwarded message is not part of the new part. Detection uses the subject only: if a message looks forwarded but its body seems cut short, read it again with `bodyScope="full"`.
+- The new part can miss answers someone typed inline into the quoted text ("see my answers below in red"). When the new part points at inline answers or seems to be missing something, read again with `bodyScope="full"`.
+- Set `bodyScope="full"` for the whole body including quoted history (for example to see an earlier message the thread no longer holds), and `bodyFormat="html"` for the original HTML, which is needed to place `cid:` inline pictures from `mail_get_inline_images` or read formatting that matters.
+- Use `mail_get_messages` with a list of `messageIds` (up to 50) to read several messages in one call instead of calling `mail_get` repeatedly. Results keep input order, and an unreadable message carries `error` without failing the others.
 - Use `mail_mark_read` to mark mail read or unread.
 - Use `mail_set_flag` to set follow-up status.
 - Use category tools to set, add, remove, clear, or manage Outlook categories. `mail_update_category` can update a master category color, but Microsoft Graph does not support renaming an existing master category.
@@ -91,8 +100,10 @@ This MCP server gives Claude local delegated access to one Microsoft 365 account
 
 ## Threads And Replies
 
-- Use `mail_get_thread` with either `messageId` or `conversationId` to inspect a conversation.
-- Thread messages are sorted locally by received time when available to avoid Microsoft Graph's inefficient filtered-sort query path.
+- Use `mail_get_thread` with either `messageId` or `conversationId` to inspect a conversation. It returns message summaries, including the user's own sent replies.
+- By default the thread comes back newest first, limited to the newest `top` messages (default 50, max 100). Use a small `top` such as 3 to catch up on the latest exchange, or `order="oldest"` to read from the start. `truncated` is true when the thread has more messages than were returned; `messageCount` is the thread size, or null when truncated.
+- Graph sorts and limits the thread in one request, so a small `top` is cheap even on a long thread.
+- To read the bodies of a thread, pass the summary IDs to `mail_get_messages`; the default new-part-only bodies avoid repeating the quoted history in every message.
 - Use `mail_create_reply_draft` to create reply or reply-all drafts in the thread.
 - Use `mail_send_draft` only after the draft looks correct. Use `mail_send_reply` only when immediate sending is explicit.
 
@@ -117,13 +128,19 @@ This MCP server gives Claude local delegated access to one Microsoft 365 account
 
 ## SharePoint And OneDrive Files
 
-- These tools browse files and folders anywhere the signed-in user has access, without mounting anything locally.
+- These tools browse files and folders anywhere the signed-in user has access, and read Word, PDF, and text files, without mounting anything locally.
 - Use `sharepoint_search_items` first for "find this file or folder anywhere" — it searches across all SharePoint sites and OneDrive.
 - Use `sharepoint_search_sites` then `sharepoint_list_drives` to go from a site name to its document libraries (each library is a "drive").
 - Use `sharepoint_get_site` when you already know the site hostname and path, for example hostname `contoso.sharepoint.com` and sitePath `Acquisitions`.
 - Use `sharepoint_list_children` to browse a folder by `driveId` plus an `itemId` or a path relative to the drive root; filter with `extensions` (e.g. `["xlsx", "pdf"]`) or `foldersOnly`.
 - Use `sharepoint_search_in_drive` to search by name inside one library.
 - Use `sharepoint_get_item_by_url` to turn a SharePoint/OneDrive sharing or browser URL into a `driveId` + `itemId`.
+- Use `sharepoint_get_file_content` to read a Word (`.docx`, `.docm`, `.dotx`, `.dotm`), PDF, or text file (`.md`, `.txt`, `.csv`, `.json`, `.xml`, `.html`, `.yaml`, `.log`) by `driveId` + `itemId`. Nothing is saved to disk.
+  - Word comes back as Markdown (`encoding: "docx-markdown"`): headings as `#`, bullet and numbered paragraphs as list items, and tables as Markdown tables, in document order. Macros in `.docm`/`.dotm` are never run. Text boxes, headers/footers, footnotes, comments, tracked-change history, and images are not included.
+  - PDF returns the text layer per page (`encoding: "pdf-text"`). A scanned PDF has no text layer and returns `unsupportedReason`.
+  - Text files are returned as-is (`encoding: "utf-8"`).
+  - Output is capped by `maxChars` (default 100,000, at most 500,000); a longer document is marked `truncated: true`. Files over `maxBytes` (default 25 MB, at most 50 MB) are refused before download. Word documents that inflate past 50 MB (or more than 100 times their compressed size) are refused. Reading stops once `maxChars` is reached, and PDFs are read for at most their first 500 pages, so `truncated: true` can also mean later pages were not read.
+  - Excel files are read with the workbook tools. Legacy `.doc`, `.rtf`, and `.odt`, password-protected documents, and other types return `unsupportedReason`.
 - Use `sharepoint_list_permissions` to inspect sharing links, named recipients, roles, and inherited access before making a change.
 - Use `sharepoint_create_link` to create an organization or anonymous view/edit link. Anonymous links can expose the item to anyone who receives the URL.
 - Use `sharepoint_grant_access` to grant named recipients read/write access. Invitation email is off unless `sendInvitation=true` is explicitly requested.

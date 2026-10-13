@@ -8,6 +8,15 @@ def test_sharing_mutations_are_audited_as_writes() -> None:
     assert classify_tool("sharepoint_revoke_permission") == "write"
 
 
+def test_sharepoint_file_reads_are_audited_as_reads() -> None:
+    assert classify_tool("sharepoint_get_file_content") == "read"
+    metadata = audit_metadata(
+        "sharepoint_get_file_content", {"driveId": "drive-1", "itemId": "item-1"}
+    )
+    assert metadata["ids"] == {"driveId": "drive-1", "itemId": "item-1"}
+    assert "mailbox" not in metadata
+
+
 def test_sharing_audit_keeps_ids_and_redacts_sensitive_values() -> None:
     arguments = {
         "driveId": "drive-1",
@@ -61,3 +70,13 @@ def test_workbook_attachment_reads_are_audited_by_id_only() -> None:
         "mailbox": "shared@example.com",
         "ids": {"messageId": "msg-1", "attachmentId": "xl-1"},
     }
+
+
+def test_batch_mail_read_is_a_read_and_records_message_ids() -> None:
+    metadata = audit_metadata(
+        "mail_get_messages",
+        {"messageIds": ["m1", "m2"], "mailbox": None, "bodyScope": "new"},
+    )
+    assert metadata["category"] == "read"
+    assert metadata["mailbox"] == "me"
+    assert metadata["ids"] == {"messageIds": ["m1", "m2"]}

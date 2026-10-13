@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import base64
 import functools
+import hashlib
 import io
+import math
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import anyio
 import httpx
@@ -58,6 +61,8 @@ from .models import (
     MailFolderInfo,
     MailFolderTreeNode,
     MailFolderTreeResult,
+    MailGetMessagesItem,
+    MailGetMessagesResult,
     MailGetResult,
     MailInlineImagesResult,
     MailListAttachmentsResult,
@@ -109,6 +114,32 @@ MESSAGE_FULL_SELECT = (
     "hasAttachments,importance,categories,flag,inferenceClassification,"
     "parentFolderId,internetMessageId,conversationId"
 )
+# Upper bound for mail_get_messages; Graph $batch takes 20 per call, so this
+# is at most three round trips.
+MAIL_GET_MESSAGES_LIMIT = 50
+# Throttled (429) or briefly unavailable $batch sub-requests are retried this
+# many times, waiting for the longest Retry-After (capped) between attempts.
+BATCH_THROTTLE_RETRIES = 3
+BATCH_RETRY_STATUSES = {429, 503, 504}
+# Longest single wait; in practice the shared budget below is the tighter limit.
+BATCH_MAX_RETRY_AFTER_SECONDS = 20.0
+# Total time one call may spend waiting between retries, across every
+# 20-item chunk, so a tool call finishes well inside MCP client timeouts.
+BATCH_RETRY_BUDGET_SECONDS = 20.0
+# Graph only accepts $orderby with $filter when the sorted property is
+# filtered first, so thread reads lead with this no-op bound.
+THREAD_DATE_FLOOR = "receivedDateTime ge 1900-01-01T00:00:00Z"
+# "FW:", "Fwd:", "[EXT] FW:", "RE: FW:"... Forwarded content is not part of
+# uniqueBody, so these always get the full body.
+# Localized forward prefixes: WG (German), TR (French), RV (Spanish),
+# VB (Swedish), VS (Finnish/Norwegian).
+_FORWARD_SUBJECT_RE = re.compile(
+    r"^\s*(?:\[[^\]]*\]\s*|(?:re|aw|sv|antw|r)\s*:\s*)*(?:fwd?|wg|tr|rv|vb|vs)\s*:",
+    re.IGNORECASE,
+)
+_HTML_TAG_RE = re.compile(
+    r"<(head|style|script)\b.*?</\1\s*>|<[^>]*>", re.IGNORECASE | re.DOTALL
+)
 MAIL_FOLDER_SELECT = (
     "id,displayName,parentFolderId,childFolderCount,totalItemCount,unreadItemCount,isHidden"
 )
@@ -123,6 +154,14 @@ CONTACT_EXTENDED_PROPERTIES_EXPAND = (
     f"'{PERSONAL_HOME_PAGE_EXTENDED_PROPERTY_ID}')"
 )
 CONTACT_FOLDER_SELECT = "id,displayName,parentFolderId"
+# YYYY-MM-DD, optionally followed by a time and a Z or +HH:MM/+HHMM/+HH offset.
+_ISO_DATETIME_RE = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})"
+    r"(?:[Tt ](\d{2}):(\d{2})(?::(\d{2})(?:[.,](\d{1,7}))?)?)?"
+    r"(Z|z|[+-]\d{2}(?::?\d{2})?)?"
+)
+# Graph continuation parameters carried in a mail_list cursor.
+_MAIL_LIST_CURSOR_KEYS = {"$skip", "$skiptoken"}
 
 
 def _build_contact_read_query(*, top: int | None = None) -> str:
@@ -225,6 +264,15 @@ SAFE_ATTACHMENT_EXTENSIONS = {
 }
 
 
+class GraphRequestError(RuntimeError):
+    """A Graph request returned a non-2xx status."""
+
+    def __init__(self, message: str, *, status: int, retry_after: str | None = None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
+
+
 class MicrosoftGraphClient:
     def __init__(
         self,
@@ -257,7 +305,20 @@ class MicrosoftGraphClient:
         categories: list[str] | None = None,
         flagStatus: str | None = None,
         inferenceClassification: str | None = None,
+        receivedAfter: str | None = None,
+        receivedBefore: str | None = None,
+        order: str = "newest",
+        cursor: str | None = None,
     ) -> MailListResult:
+        if order not in ("newest", "oldest"):
+            raise ValueError('order must be "newest" or "oldest"')
+        page_params, cursor_scope = self._mail_list_cursor_params(cursor)
+        after = self._graph_datetime(receivedAfter, "receivedAfter")
+        before = self._graph_datetime(receivedBefore, "receivedBefore")
+        if after and before and after[1] >= before[1]:
+            raise ValueError("receivedAfter must be earlier than receivedBefore")
+        received_after = after[0] if after else None
+        received_before = before[0] if before else None
         normalized_mailbox = self._normalize_mailbox(mailbox)
         base = self._base_path(normalized_mailbox)
         resolved_folder_id = folderId
@@ -279,23 +340,49 @@ class MicrosoftGraphClient:
             flagStatus=flagStatus,
             inferenceClassification=inferenceClassification,
         )
+        # Graph rejects $orderby with $filter ("InefficientFilter") unless the
+        # sorted property is also filtered, and filtered first. A no-op lower
+        # bound keeps the sort working alongside the other filters.
+        date_filters: list[str] = []
+        if received_after:
+            date_filters.append(f"receivedDateTime ge {received_after}")
+        elif filters or received_before:
+            date_filters.append("receivedDateTime ge 1900-01-01T00:00:00Z")
+        if received_before:
+            date_filters.append(f"receivedDateTime lt {received_before}")
+        filters = date_filters + filters
         params: dict[str, str] = {
             "$top": str(min(top, 100)),
             "$select": MESSAGE_SUMMARY_SELECT,
+            "$orderby": f"receivedDateTime {'desc' if order == 'newest' else 'asc'}",
         }
         if filters:
             params["$filter"] = " and ".join(filters)
+        path = self._mail_folder_messages_path(base, legacy_folder, resolved_folder_id)
+        scope = self._mail_list_scope(path, params)
+        if cursor_scope is not None and cursor_scope != scope:
+            raise ValueError(
+                "cursor was returned for different mail_list arguments; pass the "
+                "same mailbox, folder, filters, and order as the call that "
+                "returned it, or omit cursor to start again"
+            )
+        params.update(page_params)
         query = httpx.QueryParams(params)
-        result = await self._request(
-            f"{self._mail_folder_messages_path(base, legacy_folder, resolved_folder_id)}?{query}"
-        )
+        result = await self._request(f"{path}?{query}")
 
+        messages = [self._map_message_summary(message) for message in result["value"]]
+        next_cursor = self._mail_list_next_cursor(result.get("@odata.nextLink"), scope)
         return MailListResult(
             mailbox=normalized_mailbox or "me",
             folder=folder,
             folderId=resolved_folder_id,
             folderPath=resolved_folder_path,
-            messages=[self._map_message_summary(message) for message in result["value"]],
+            order=order,
+            receivedAfter=received_after,
+            receivedBefore=received_before,
+            hasMore=next_cursor is not None,
+            nextCursor=next_cursor,
+            messages=messages,
         )
 
     async def check_inbox(
@@ -363,20 +450,82 @@ class MicrosoftGraphClient:
         *,
         mailbox: str | None = None,
         messageId: str,
+        bodyFormat: str = "text",
+        bodyScope: str = "new",
     ) -> MailGetResult:
         normalized_mailbox = self._normalize_mailbox(mailbox)
         base = self._base_path(normalized_mailbox)
-        params = httpx.QueryParams(
-            {
-                "$select": MESSAGE_FULL_SELECT,
-            }
-        )
+        prefer = self._message_body_prefer(bodyFormat)
+        self._validate_body_scope(bodyScope)
         message = await self._request(
-            f"{base}/messages/{quote(messageId, safe='')}?{params}"
+            self._message_read_path(base, messageId, bodyScope),
+            headers={"Prefer": prefer},
         )
         return MailGetResult(
             mailbox=normalized_mailbox or "me",
-            message=self._map_full_message(message),
+            message=self._map_full_message(message, bodyScope=bodyScope),
+        )
+
+    async def get_messages(
+        self,
+        *,
+        mailbox: str | None = None,
+        messageIds: list[str],
+        bodyFormat: str = "text",
+        bodyScope: str = "new",
+    ) -> MailGetMessagesResult:
+        """Read several messages in one call via Graph ``$batch``.
+
+        Results keep input order; a message that cannot be read carries an
+        ``error`` without failing the rest."""
+        if not messageIds:
+            raise ValueError("Provide at least one messageId")
+        if len(messageIds) > MAIL_GET_MESSAGES_LIMIT:
+            raise ValueError(
+                f"mail_get_messages reads at most {MAIL_GET_MESSAGES_LIMIT} "
+                f"messages per call; got {len(messageIds)}"
+            )
+        if any(not str(message_id or "").strip() for message_id in messageIds):
+            raise ValueError("messageIds must not contain empty values")
+        normalized_mailbox = self._normalize_mailbox(mailbox)
+        base = self._base_path(normalized_mailbox)
+        prefer = self._message_body_prefer(bodyFormat)
+        self._validate_body_scope(bodyScope)
+        responses = await self._batch(
+            [
+                {
+                    "id": str(index),
+                    "method": "GET",
+                    "url": self._message_read_path(base, message_id, bodyScope),
+                    "headers": {"Prefer": prefer},
+                }
+                for index, message_id in enumerate(messageIds)
+            ]
+        )
+        items: list[MailGetMessagesItem] = []
+        for index, message_id in enumerate(messageIds):
+            response = responses.get(str(index))
+            error = self._batch_error(response)
+            if error is not None or response is None:
+                items.append(MailGetMessagesItem(messageId=message_id, error=error))
+                continue
+            body = response.get("body")
+            try:
+                if not isinstance(body, dict) or not body.get("id"):
+                    raise ValueError("Graph returned no message")
+                message = self._map_full_message(body, bodyScope=bodyScope)
+            except Exception as mapping_error:
+                items.append(
+                    MailGetMessagesItem(
+                        messageId=message_id,
+                        error=f"Could not read message: {mapping_error}",
+                    )
+                )
+                continue
+            items.append(MailGetMessagesItem(messageId=message_id, message=message))
+        return MailGetMessagesResult(
+            mailbox=normalized_mailbox or "me",
+            messages=items,
         )
 
     async def list_drafts(
@@ -1254,7 +1403,10 @@ class MicrosoftGraphClient:
         messageId: str | None = None,
         conversationId: str | None = None,
         top: int = 50,
+        order: str = "newest",
     ) -> MailThreadResult:
+        if order not in ("newest", "oldest"):
+            raise ValueError('order must be "newest" or "oldest"')
         normalized_mailbox = self._normalize_mailbox(mailbox)
         base = self._base_path(normalized_mailbox)
         resolved_conversation_id = conversationId
@@ -1266,24 +1418,33 @@ class MicrosoftGraphClient:
             )
             resolved_conversation_id = str(message["conversationId"])
 
+        limit = max(1, min(top, 100))
+        # One request: Graph sorts and limits server-side. It only accepts
+        # $orderby with $filter when the sorted property is filtered first,
+        # hence the leading no-op date bound.
         params = httpx.QueryParams(
             {
-                "$top": str(min(top, 100)),
+                "$top": str(limit),
                 "$select": MESSAGE_SUMMARY_SELECT,
                 "$filter": (
-                    "conversationId eq "
+                    f"{THREAD_DATE_FLOOR} and conversationId eq "
                     f"'{self._escape_odata_string(resolved_conversation_id)}'"
                 ),
+                "$orderby": f"receivedDateTime {'desc' if order == 'newest' else 'asc'}",
             }
         )
         result = await self._request(f"{base}/messages?{params}")
         messages = [
-            self._map_message_summary(message) for message in result["value"]
+            self._map_message_summary(message) for message in result.get("value") or []
         ]
-        messages.sort(key=lambda message: message.receivedDateTime or "")
+        truncated = bool(result.get("@odata.nextLink"))
         return MailThreadResult(
             mailbox=normalized_mailbox or "me",
             conversationId=resolved_conversation_id,
+            order=order,
+            # Only exact when the whole thread fit in one page.
+            messageCount=None if truncated else len(messages),
+            truncated=truncated,
             messages=messages,
         )
 
@@ -1449,8 +1610,7 @@ class MicrosoftGraphClient:
         messageId: str,
         categories: list[str],
     ) -> MailUpdateMessageResult:
-        current = await self.get_message(mailbox=mailbox, messageId=messageId)
-        existing = list(current.message.categories)
+        existing = await self._message_categories(mailbox, messageId)
         for category in categories:
             if category not in existing:
                 existing.append(category)
@@ -1467,15 +1627,20 @@ class MicrosoftGraphClient:
         messageId: str,
         categories: list[str],
     ) -> MailUpdateMessageResult:
-        current = await self.get_message(mailbox=mailbox, messageId=messageId)
+        current = await self._message_categories(mailbox, messageId)
         remove = set(categories)
         return await self.set_message_categories(
             mailbox=mailbox,
             messageId=messageId,
-            categories=[
-                category for category in current.message.categories if category not in remove
-            ],
+            categories=[category for category in current if category not in remove],
         )
+
+    async def _message_categories(self, mailbox: str | None, messageId: str) -> list[str]:
+        base = self._base_path(self._normalize_mailbox(mailbox))
+        result = await self._request(
+            f"{base}/messages/{quote(messageId, safe='')}?$select=categories"
+        )
+        return list((result or {}).get("categories") or [])
 
     async def clear_message_categories(
         self,
@@ -2178,6 +2343,12 @@ class MicrosoftGraphClient:
         headers: dict[str, str] | None = None,
         json_body: dict[str, Any] | None = None,
     ) -> Any:
+        # Absolute URLs come from Graph's @odata.nextLink; never send the
+        # bearer token anywhere but Graph.
+        if path.startswith("https://") and (
+            urlsplit(path).hostname != "graph.microsoft.com"
+        ):
+            raise ValueError("Refusing to send a request outside graph.microsoft.com")
         access_token = await self._auth_service.get_access_token()
         request_headers = {
             "Accept": "application/json",
@@ -2203,7 +2374,13 @@ class MicrosoftGraphClient:
         if response.status_code == 204:
             return None
 
-        data = response.json() if response.text else None
+        try:
+            data = response.json() if response.text else None
+        except ValueError:
+            # Proxies and gateways can answer with HTML or plain text.
+            if response.is_success:
+                raise
+            data = None
         if not response.is_success:
             error_message = (
                 data.get("error", {}).get("message")
@@ -2220,11 +2397,120 @@ class MicrosoftGraphClient:
                 else None
             )
             detail = f"{error_code}: {error_message}" if error_code else error_message
-            raise RuntimeError(
-                f"Microsoft Graph request failed ({response.status_code}): {detail}"
+            raise GraphRequestError(
+                f"Microsoft Graph request failed ({response.status_code}): {detail}",
+                status=response.status_code,
+                retry_after=response.headers.get("Retry-After"),
             )
 
         return data
+
+    async def _batch(
+        self, requests: list[dict[str, Any]]
+    ) -> dict[str, dict[str, Any]]:
+        """Send Graph ``POST /$batch`` requests, chunked to 20 per call.
+
+        Each entry is ``{"id", "method", "url", "headers"?}`` with ``url``
+        relative to ``/v1.0``. Returns raw inner responses keyed by id.
+
+        Never raises for a Graph or network failure: if a whole chunk fails,
+        each of its requests gets a synthetic response carrying the error,
+        so results already read in other chunks are kept."""
+        responses: dict[str, dict[str, Any]] = {}
+        budget = BATCH_RETRY_BUDGET_SECONDS
+        for start in range(0, len(requests), 20):
+            pending = requests[start : start + 20]
+            # Every sub-request hits the same mailbox, so per-item throttling
+            # is common; retry those, honouring Retry-After, before giving up.
+            for attempt in range(BATCH_THROTTLE_RETRIES + 1):
+                try:
+                    data = await self._request(
+                        "/$batch", method="POST", json_body={"requests": pending}
+                    )
+                except (GraphRequestError, httpx.HTTPError) as error:
+                    # A network error carries no status; retry it like a 503.
+                    status = getattr(error, "status", None) or 503
+                    for request in pending:
+                        responses[str(request["id"])] = {
+                            "id": request["id"],
+                            "status": status,
+                            "headers": {"Retry-After": getattr(error, "retry_after", None)},
+                            "error": str(error) or type(error).__name__,
+                        }
+                else:
+                    for response in (data or {}).get("responses", []):
+                        responses[str(response.get("id"))] = response
+                throttled = [
+                    request
+                    for request in pending
+                    if responses.get(str(request["id"]), {}).get("status")
+                    in BATCH_RETRY_STATUSES
+                ]
+                if not throttled or attempt == BATCH_THROTTLE_RETRIES:
+                    break
+                wait = max(
+                    self._retry_after_seconds(responses[str(request["id"])], attempt)
+                    for request in throttled
+                )
+                if wait > budget:
+                    break
+                budget -= wait
+                await anyio.sleep(wait)
+                pending = throttled
+        return responses
+
+    @staticmethod
+    def _retry_after_seconds(response: dict[str, Any], attempt: int) -> float:
+        """Seconds to wait before retrying a throttled ``$batch`` item."""
+        headers = response.get("headers") or {}
+        value = next(
+            (v for k, v in headers.items() if str(k).lower() == "retry-after"),
+            None,
+        )
+        try:
+            seconds = float(value) if value is not None else 2.0**attempt
+        except (TypeError, ValueError):
+            seconds = 2.0**attempt
+        if not math.isfinite(seconds):
+            seconds = 2.0**attempt
+        return min(max(seconds, 0.0), BATCH_MAX_RETRY_AFTER_SECONDS)
+
+    @staticmethod
+    def _batch_error(response: dict[str, Any] | None) -> str | None:
+        """Error text for a failed inner ``$batch`` response, else None."""
+        if response is None:
+            return "no response returned for this request"
+        if response.get("error"):
+            return str(response["error"])
+        status = response.get("status")
+        if isinstance(status, int) and 200 <= status < 300:
+            return None
+        body = response.get("body")
+        error = body.get("error") if isinstance(body, dict) else None
+        if isinstance(error, dict):
+            code = error.get("code")
+            message = error.get("message")
+            detail = f"{code}: {message}" if code and message else code or message
+            if detail:
+                return f"Microsoft Graph request failed ({status}): {detail}"
+        return f"Microsoft Graph request failed ({status})"
+
+    @staticmethod
+    def _message_body_prefer(bodyFormat: str) -> str:
+        if bodyFormat not in ("text", "html"):
+            raise ValueError('bodyFormat must be "text" or "html"')
+        return f'IdType="ImmutableId", outlook.body-content-type="{bodyFormat}"'
+
+    @staticmethod
+    def _validate_body_scope(bodyScope: str) -> None:
+        if bodyScope not in ("new", "full"):
+            raise ValueError('bodyScope must be "new" or "full"')
+
+    @staticmethod
+    def _message_read_path(base: str, messageId: str, bodyScope: str) -> str:
+        select = MESSAGE_FULL_SELECT + (",uniqueBody" if bodyScope == "new" else "")
+        params = httpx.QueryParams({"$select": select})
+        return f"{base}/messages/{quote(messageId, safe='')}?{params}"
 
     async def _request_bytes(self, path: str) -> bytes:
         access_token = await self._auth_service.get_access_token()
@@ -2392,6 +2678,116 @@ class MicrosoftGraphClient:
                 f"'{self._escape_odata_string(inferenceClassification)}'"
             )
         return filters
+
+    @staticmethod
+    def _graph_datetime(
+        value: str | None, name: str
+    ) -> tuple[str, tuple[datetime, int]] | None:
+        """Normalize an ISO 8601 date or date-time to a UTC OData literal.
+
+        Returns the literal and a sort key. A value without an offset
+        (including a bare date) is read as UTC. Parsed by hand rather than
+        with datetime.fromisoformat, which accepts different formats on
+        Python 3.10 and 3.11+, and so fractional seconds of any precision
+        survive unchanged."""
+        text = (value or "").strip()
+        if not text:
+            return None
+        invalid = ValueError(
+            f"{name} must be an ISO 8601 date or date-time, such as "
+            f"2026-10-01 or 2026-10-01T09:00:00-05:00; got {value!r}"
+        )
+        match = _ISO_DATETIME_RE.fullmatch(text)
+        if not match:
+            raise invalid
+        year, month, day, hour, minute, second, fraction, zone = match.groups()
+        if int(year) < 1900:
+            raise ValueError(f"{name} must be in 1900 or later; got {value!r}")
+        offset = timedelta(0)
+        if zone and zone not in "Zz":
+            sign = -1 if zone[0] == "-" else 1
+            digits = zone[1:].replace(":", "")
+            if int(digits[2:] or 0) > 59:
+                raise invalid
+            offset = sign * timedelta(hours=int(digits[:2]), minutes=int(digits[2:] or 0))
+        try:
+            parsed = datetime(
+                int(year),
+                int(month),
+                int(day),
+                int(hour or 0),
+                int(minute or 0),
+                int(second or 0),
+                tzinfo=timezone(offset),
+            ).astimezone(timezone.utc)
+        except (ValueError, OverflowError) as exc:
+            raise invalid from exc
+        literal = parsed.strftime("%Y-%m-%dT%H:%M:%S")
+        if fraction:
+            literal += f".{fraction}"
+        return f"{literal}Z", (parsed, int((fraction or "").ljust(9, "0")))
+
+    @staticmethod
+    def _mail_list_scope(path: str, params: dict[str, str]) -> str:
+        """Fingerprint of what a mail_list page lists (mailbox, folder,
+        filter, order), so a cursor is only accepted by the query that made
+        it. ``$top`` is left out: changing the page size is harmless."""
+        key = "\n".join((path, params.get("$filter", ""), params.get("$orderby", "")))
+        return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+    @staticmethod
+    def _mail_list_next_cursor(next_link: str | None, scope: str) -> str | None:
+        """Turn Graph's @odata.nextLink into an opaque mail_list cursor.
+
+        With a $filter, Graph's continuation $skip counts mailbox items
+        scanned rather than messages returned, so only Graph's own value pages
+        correctly. Only the continuation parameters are kept; the next call
+        rebuilds the request from its own arguments, so the link itself is
+        never followed and the token never leaves graph.microsoft.com."""
+        if not next_link:
+            return None
+        parts = urlsplit(next_link)
+        if parts.scheme != "https" or parts.hostname != "graph.microsoft.com":
+            return None
+        continuation = [
+            (key, value)
+            for key, value in parse_qsl(parts.query)
+            if key in _MAIL_LIST_CURSOR_KEYS
+        ]
+        if not continuation:
+            return None
+        payload = urlencode([*continuation, ("scope", scope)])
+        return base64.urlsafe_b64encode(payload.encode()).decode()
+
+    @staticmethod
+    def _mail_list_cursor_params(
+        cursor: str | None,
+    ) -> tuple[dict[str, str], str | None]:
+        """Decode a mail_list cursor into Graph continuation parameters and
+        the scope fingerprint of the query that produced it."""
+        if not cursor:
+            return {}, None
+        invalid = ValueError(
+            "cursor must be a nextCursor value returned by mail_list"
+        )
+        try:
+            pairs = parse_qsl(
+                base64.urlsafe_b64decode(cursor.encode()).decode(),
+                strict_parsing=True,
+            )
+        except ValueError as exc:
+            raise invalid from exc
+        params = dict(pairs)
+        scope = params.pop("scope", None)
+        if (
+            len(params) + 1 != len(pairs)
+            or not params
+            or not scope
+            or not set(params) <= _MAIL_LIST_CURSOR_KEYS
+            or not re.fullmatch(r"[0-9]+", params.get("$skip", "0"))
+        ):
+            raise invalid
+        return params, scope
 
     def _escape_odata_string(self, value: str) -> str:
         return value.replace("'", "''")
@@ -2908,8 +3304,22 @@ class MicrosoftGraphClient:
             conversationId=self._nullable_string(message.get("conversationId")),
         )
 
-    def _map_full_message(self, message: dict[str, Any]) -> FullMessage:
+    def _map_full_message(
+        self, message: dict[str, Any], *, bodyScope: str = "full"
+    ) -> FullMessage:
         body = message.get("body") or {}
+        returned_scope = "full"
+        unique_body = message.get("uniqueBody") or {}
+        # uniqueBody can come back empty (or as an empty HTML shell), and for
+        # a forward it leaves out the forwarded message, which is the point
+        # of the mail; in both cases return the full body.
+        if (
+            bodyScope == "new"
+            and not _FORWARD_SUBJECT_RE.match(str(message.get("subject") or ""))
+            and self._has_visible_text(unique_body)
+        ):
+            body = unique_body
+            returned_scope = "new"
         return FullMessage(
             id=str(message["id"]),
             subject=str(message.get("subject") or ""),
@@ -2926,6 +3336,7 @@ class MicrosoftGraphClient:
                 contentType=str(body.get("contentType") or "text"),
                 content=str(body.get("content") or ""),
             ),
+            bodyScope=returned_scope,
             webLink=self._nullable_string(message.get("webLink")),
             isDraft=bool(message.get("isDraft", False)),
             isRead=(
@@ -2950,6 +3361,13 @@ class MicrosoftGraphClient:
             internetMessageId=self._nullable_string(message.get("internetMessageId")),
             conversationId=self._nullable_string(message.get("conversationId")),
         )
+
+    @staticmethod
+    def _has_visible_text(body: dict[str, Any]) -> bool:
+        content = str(body.get("content") or "")
+        if str(body.get("contentType") or "").lower() == "html":
+            content = _HTML_TAG_RE.sub("", content).replace("&nbsp;", "")
+        return bool(content.strip())
 
     def _map_event(self, event: dict[str, Any]) -> CalendarEvent:
         body = event.get("body") or {}

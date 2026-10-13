@@ -3,8 +3,8 @@
   "name": "m365-mcp",
   "display_name": "Microsoft 365",
   "version": "26.04",
-  "description": "Local MCP server for one Microsoft 365 user: mail, folders, rules, categories, contacts, calendar, SharePoint browsing, and in-place Excel editing.",
-  "long_description": "Gives an MCP client delegated Microsoft Graph access to a single user's Microsoft 365 account.\n\n- Read, search, draft, send, move, flag, and categorize mail, including shared/delegated mailboxes.\n- Create, rename, and delete mail folders; manage Outlook Inbox rules and master categories.\n- Read message threads and small text/PDF attachments.\n- View image attachments and inline pictures embedded in message bodies.\n- Look at PDF attachments page by page, including scanned documents, by rendering pages to images.\n- Read cell values, formulas, and defined names from Excel (.xlsx/.xlsm) attachments without saving them.\n- Search, create, update, and delete contacts and calendar events.\n- Browse SharePoint sites, document libraries, and folders.\n- Resolve sharing URLs; list access; create links; grant named users access; and revoke permissions.\n- Edit Excel workbooks stored in SharePoint/OneDrive in place through the Graph Workbook API.\n\nThe server runs entirely on your machine. Sign-in uses the Microsoft authorization-code flow with PKCE against your own Entra app registration; tokens are cached locally and encrypted at rest with AES-256-GCM. There is deliberately no tool that deletes a SharePoint or OneDrive file or folder.",
+  "description": "Local MCP server for one Microsoft 365 user: mail, folders, rules, categories, contacts, calendar, SharePoint browsing and file reading, and in-place Excel editing.",
+  "long_description": "Gives an MCP client delegated Microsoft Graph access to a single user's Microsoft 365 account.\n\n- Read, search, draft, send, move, flag, and categorize mail, including shared/delegated mailboxes.\n- Create, rename, and delete mail folders; manage Outlook Inbox rules and master categories.\n- Read message threads and small text/PDF attachments.\n- View image attachments and inline pictures embedded in message bodies.\n- Look at PDF attachments page by page, including scanned documents, by rendering pages to images.\n- Read cell values, formulas, and defined names from Excel (.xlsx/.xlsm) attachments without saving them.\n- Search, create, update, and delete contacts and calendar events.\n- Browse SharePoint sites, document libraries, and folders.\n- Read Word (.docx), PDF, and text/Markdown files stored in SharePoint/OneDrive.\n- Resolve sharing URLs; list access; create links; grant named users access; and revoke permissions.\n- Edit Excel workbooks stored in SharePoint/OneDrive in place through the Graph Workbook API.\n\nThe server runs entirely on your machine. Sign-in uses the Microsoft authorization-code flow with PKCE against your own Entra app registration; tokens are cached locally and encrypted at rest with AES-256-GCM. There is deliberately no tool that deletes a SharePoint or OneDrive file or folder.",
   "author": {
     "name": "ianrelecker",
     "url": "https://github.com/ianrelecker"
@@ -124,11 +124,11 @@
     },
     {
       "name": "mail_list",
-      "description": "List messages from a mailbox folder. Use mailbox for shared/delegated mailboxes the signed-in Microsoft user can access."
+      "description": "List messages from a mailbox folder, newest first by default (order=\"oldest\" reverses). receivedAfter (inclusive) and receivedBefore (exclusive) take ISO 8601 dates or date-times, read as UTC unless\u2026"
     },
     {
       "name": "mail_check_inbox",
-      "description": "Quickly check an inbox or shared inbox folder. Defaults to unread messages in Inbox and includes triage metadata."
+      "description": "Quickly check an inbox or shared inbox folder. Defaults to unread messages in Inbox, newest first, and includes triage metadata."
     },
     {
       "name": "mail_list_folders",
@@ -176,7 +176,11 @@
     },
     {
       "name": "mail_get",
-      "description": "Get the full details and body of one message by ID. Use mailbox for shared/delegated mailboxes."
+      "description": "Get the details and body of one message by ID. By default the body is plain text and only the part new to this message (no quoted thread), which is far smaller than the raw HTML; message.bodyScope\u2026"
+    },
+    {
+      "name": "mail_get_messages",
+      "description": "Get several messages by ID in one call (up to 50), with the same bodyFormat/bodyScope options and defaults as mail_get. Results keep the input order; a message that cannot be read carries an error\u2026"
     },
     {
       "name": "mail_list_drafts",
@@ -212,7 +216,7 @@
     },
     {
       "name": "mail_get_inline_images",
-      "description": "View the pictures embedded in a message body. Returns each inline image as image content, keyed by the contentId that the HTML body references as cid:. Set includeNonInline to also pull regular\u2026"
+      "description": "View the pictures embedded in a message body. Returns each inline image as image content, keyed by the contentId that the HTML body references as cid:. To see where each image sits, read the body\u2026"
     },
     {
       "name": "mail_get_attachment_pdf_pages",
@@ -224,7 +228,7 @@
     },
     {
       "name": "mail_get_thread",
-      "description": "Get messages in the same conversation by messageId or conversationId."
+      "description": "Get message summaries in the same conversation by messageId or conversationId, including sent replies. Returns the newest `top` (max 100) messages newest first by default; order=\"oldest\" returns the\u2026"
     },
     {
       "name": "mail_create_reply_draft",
@@ -361,6 +365,10 @@
     {
       "name": "sharepoint_get_item_by_url",
       "description": "Resolve a SharePoint or OneDrive sharing/browser URL to a drive item, returning its driveId and itemId for further browsing."
+    },
+    {
+      "name": "sharepoint_get_file_content",
+      "description": "Read a Word (.docx, .docm, .dotx, .dotm), PDF, or text (.md, .txt, .csv, .json, ...) file from SharePoint or OneDrive by driveId and itemId. Word comes back as Markdown (headings, lists, tables)\u2026"
     },
     {
       "name": "sharepoint_list_permissions",

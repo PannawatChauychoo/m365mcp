@@ -19,6 +19,7 @@ Claude can:
 - Search, create, update, and delete contacts.
 - List, create, update, and delete calendar events.
 - Browse SharePoint sites, document libraries, and folders, and find files anywhere you have access.
+- Read Word (.docx), PDF, and text/Markdown files stored in SharePoint/OneDrive; Word documents come back as Markdown with headings, lists, and tables.
 - Edit Excel workbooks stored in SharePoint/OneDrive in place: read and write cell ranges and append table rows.
 
 Claude can also read [M365_MCP_CAPABILITIES.md](M365_MCP_CAPABILITIES.md) through the `m365_capabilities` tool or the `m365://capabilities` MCP resource.
@@ -250,6 +251,7 @@ Once authenticated, ask Claude things like:
 - `Move this message to Inbox/Clients/Acme.`
 - `Create a rule that moves Acme invoices to that folder.`
 - `Read the PDF attachment on this email.`
+- `Summarize the investment memo Word doc in the Acme deal folder on SharePoint.`
 - `What's the total on the invoice attached to that email?`
 - `The contract attachment is a scan — what does page 3 say?`
 - `What purchase price and cap rate are in the Excel model attached to that email?`
@@ -335,6 +337,7 @@ Mail and folders:
 - `mail_list`
 - `mail_search`
 - `mail_get`
+- `mail_get_messages`
 - `mail_list_drafts`
 - `mail_create_draft`
 - `mail_send`
@@ -400,6 +403,7 @@ SharePoint and OneDrive files:
 - `sharepoint_list_children`
 - `sharepoint_search_in_drive`
 - `sharepoint_get_item_by_url`
+- `sharepoint_get_file_content`
 - `sharepoint_list_permissions`
 - `sharepoint_create_link`
 - `sharepoint_grant_access`
@@ -439,12 +443,24 @@ Excel workbooks:
 ## Mail Notes
 
 - Prefer `mail_check_inbox` or `mail_list` filters for fast inbox triage. `mail_search` uses Microsoft Graph `$search`, which can be slower on large mailboxes.
-- `mail_get_thread` sorts returned thread messages locally by received time when available instead of asking Graph to sort a filtered conversation query.
+- `mail_list` sorts by received time (`order`, newest first by default), filters by `receivedAfter`/`receivedBefore`, and pages with an opaque `cursor`/`nextCursor`. The cursor carries only Graph's own continuation (`$skip`/`$skiptoken` from `@odata.nextLink`, which counts scanned items when a filter is applied); the next call rebuilds the request from its arguments, so the link is never followed. The cursor also carries a fingerprint of the mailbox, folder, filter, and order, and is refused if a later call changes any of them. Graph only allows `$orderby` together with `$filter` when the sorted property is filtered first, so the server always leads the filter with a `receivedDateTime` bound (a no-op lower bound when no date is given).
+- `mail_check_inbox` is built on `mail_list`, so it now also always sends `$orderby=receivedDateTime desc` and returns the newest messages first. Before, the order was whatever Graph returned by default.
+- `mail_get_thread` asks Graph for the thread sorted by received time with `$top` (one request; the filter leads with a no-op `receivedDateTime` bound because Graph only allows `$orderby` with `$filter` when the sorted property is filtered first). `truncated` is set when the thread has more messages, and `messageCount` is then null.
+- `mail_get` and `mail_get_messages` return plain-text bodies holding only the part new to each message (Graph `uniqueBody`) by default, falling back to the full body when Graph has no separate new part and for forwards (detected by subject prefix: `FW:`/`Fwd:` and the German, French, Spanish, and Nordic equivalents); `bodyScope="full"` and `bodyFormat="html"` restore the full HTML body.
+- `mail_get_messages` uses Graph `$batch` (20 per request) and retries throttled (429) or unavailable (503/504) items up to 3 times, waiting for Graph's `Retry-After`. All waits in one call share a 20-second budget, and a wait longer than what is left is not attempted. A failed `$batch` request, including a throttled one or a network error (both retried the same way), becomes a per-message error for that chunk instead of failing the whole call.
 - `mail_update_category` can update an Outlook master category color. Microsoft Graph does not support renaming an existing master category; create a new category and delete the old one only after confirming that is safe.
+
+### Behaviour changes for existing callers
+
+These defaults changed on purpose to cut the tokens a mail read costs:
+
+- **`mail_get` body:** was the full HTML body; now plain text holding only the new part. Pass `bodyFormat="html"` and `bodyScope="full"` for the old output. That is also what `mail_get_inline_images` needs to place `cid:` pictures, since it matches the HTML body.
+- **`mail_get_thread` order:** was oldest first; now newest first, and `top` keeps the newest messages. Pass `order="oldest"` for the old order.
 
 ## SharePoint And Excel Notes
 
 - Start with `sharepoint_search_items` to find a file or folder anywhere you have access, or walk `sharepoint_search_sites` -> `sharepoint_list_drives` -> `sharepoint_list_children`. You can also resolve a pasted Microsoft sharing URL with `sharepoint_get_item_by_url`. Each tool returns a `driveId` and `itemId` you can pass on.
+- `sharepoint_get_file_content` reads a Word (`.docx`, `.docm`, `.dotx`, `.dotm`), PDF, or text file by `driveId` + `itemId`. Word documents come back as Markdown; PDFs return their text layer, so a scanned PDF has nothing to read. Legacy `.doc` files are not supported.
 - Use `sharepoint_list_permissions` before changing access. `sharepoint_create_link` creates organization or anonymous view/edit links, `sharepoint_grant_access` gives named recipients read/write access, and `sharepoint_revoke_permission` removes a non-inherited direct grant or an entire sharing link. All three mutations require explicit confirmation. Invitation email is off by default.
 - The `workbook_*` tools edit `.xlsx` files **in place** through the Microsoft Graph Workbook API. Resolve the file once with `workbook_resolve`, then reuse its `driveId` + `itemId`. Edits are applied by Excel server-side, so formulas, formatting, and validation are preserved, and SharePoint versions every change.
 - `workbook_update_range` and `workbook_add_table_row` write directly to the stored file, so confirm the workbook, worksheet, and range before writing.

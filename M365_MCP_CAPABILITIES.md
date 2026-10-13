@@ -23,6 +23,10 @@ This MCP server gives Claude local delegated access to one Microsoft 365 account
 
 - Message summaries include read state, attachment presence, importance, categories, flag status, Focused/Other inference classification, parent folder ID, sender, reply-to, internet message ID, and conversation ID.
 - `inferenceClassification` is a Microsoft Graph message property for Focused Inbox, not a separate app-registration permission.
+- `mail_list` returns the newest messages first. Use `order="oldest"` to start from the oldest.
+- Narrow `mail_list` by date with `receivedAfter` (inclusive) and `receivedBefore` (exclusive). Both take an ISO 8601 date such as `2026-10-01` or a date-time such as `2026-10-01T09:00:00-05:00` (fractional seconds are kept). A value without an offset is read as UTC, so give the user's offset when the exact day boundary matters. Date filters combine with every other filter, including `inferenceClassification`, so "Focused mail from last week" is one call.
+- `mail_list` pages with an opaque cursor. When a result has `hasMore: true`, call again with the same arguments and `cursor` set to `nextCursor`. A cursor is rejected if the mailbox, folder, filters, or order differ from the call that returned it; `top` may change. Mail that arrives between calls can shift a newest-first page by a message or two, so fix `receivedBefore` when paging through a busy folder.
+- `mail_check_inbox` also returns the newest messages first.
 - Prefer `mail_check_inbox` or `mail_list` filters for quick triage. `mail_search` delegates to Microsoft Graph `$search`, which can be slower on large mailboxes.
 - `mail_get` returns a plain-text body containing only the part new to that message by default (Microsoft Graph `uniqueBody`), so a reply no longer drags its HTML, signature styling, and quoted thread along. `message.bodyScope` is `"new"` when that worked and `"full"` when Graph had no separate new part and the whole body came back instead.
 - Forwards (subjects starting `FW:`/`Fwd:`, also after `RE:` or a `[tag]`) always come back with the full body, because the forwarded message is not part of the new part.

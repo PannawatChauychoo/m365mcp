@@ -205,10 +205,20 @@ async def test_search_items_posts_search_query_and_parses_hits() -> None:
         assert req["entityTypes"] == ["driveItem"]
         assert req["query"]["queryString"] == "tracker"
         assert req["size"] == 200  # clamped from 999
-        # Without these the Search API cannot tell folders from files.
-        assert {"isContainer", "contentTypeId", "id", "name", "parentReference"} <= set(
-            req["fields"]
-        )
+        # Asking for fields replaces the default driveItem properties, so the
+        # list must hold everything _map_item reads plus the folder signals.
+        assert req["fields"] == [
+            "id",
+            "name",
+            "size",
+            "webUrl",
+            "lastModifiedDateTime",
+            "parentReference",
+            "file",
+            "folder",
+            "isContainer",
+            "contentTypeId",
+        ]
         return httpx.Response(
             200,
             json={

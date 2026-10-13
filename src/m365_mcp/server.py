@@ -289,7 +289,9 @@ class _HelperServerRunner:
                 # Another copy can take the port between the check above and
                 # the bind (Claude Desktop starts two at once). uvicorn reports
                 # a failed bind with sys.exit(1); keep the MCP server running.
-                if server.started:
+                # Anything else, including a failure while the port is still
+                # free, is a real error and is not hidden.
+                if server.started or _can_bind_localhost(self._runtime.config.port):
                     raise
                 self._server = None
                 self._report_port_in_use()

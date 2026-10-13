@@ -6,6 +6,7 @@ import json
 import socket
 from pathlib import Path
 
+import anyio
 import httpx
 import pytest
 from mcp.shared.memory import create_connected_server_and_client_session
@@ -522,11 +523,16 @@ async def test_mcp_server_stays_up_when_helper_port_is_busy(config_factory) -> N
 
 @pytest.mark.anyio
 async def test_mcp_server_stays_up_when_helper_port_is_taken_after_check(
-    config_factory, monkeypatch
+    config_factory, monkeypatch, capsys
 ) -> None:
     # Claude Desktop starts two copies at once; both can pass the free-port
     # check before either binds, so the loser only finds out from uvicorn.
-    monkeypatch.setattr("m365_mcp.server._can_bind_localhost", lambda port: True)
+    # The first check sees a free port; the re-check after the failed bind
+    # sees it taken, which is what identifies the race.
+    checks = iter([True])
+    monkeypatch.setattr(
+        "m365_mcp.server._can_bind_localhost", lambda port: next(checks, False)
+    )
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
     sock.listen()
@@ -558,6 +564,46 @@ async def test_mcp_server_stays_up_when_helper_port_is_taken_after_check(
     finally:
         sock.close()
         await http_client.aclose()
+    # The helper really lost the bind and took the race path.
+    assert "already in use" in capsys.readouterr().err
+
+
+@pytest.mark.anyio
+async def test_helper_startup_errors_are_not_reported_as_a_busy_port(
+    monkeypatch, capsys
+) -> None:
+    import types
+
+    from m365_mcp import server as server_module
+
+    class FailingServer:
+        started = False
+        should_exit = False
+
+        def __init__(self, config) -> None:
+            pass
+
+        async def serve(self) -> None:
+            raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(server_module, "_can_bind_localhost", lambda port: True)
+    monkeypatch.setattr(server_module, "create_helper_app", lambda *args: None)
+    monkeypatch.setattr(server_module.uvicorn, "Config", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server_module.uvicorn, "Server", FailingServer)
+    runtime = types.SimpleNamespace(
+        config=types.SimpleNamespace(port=8787), microsoft_auth=None
+    )
+
+    runner = server_module._HelperServerRunner(runtime)
+    with pytest.raises(BaseException) as raised:
+        await runner.run(task_status=anyio.TASK_STATUS_IGNORED)
+
+    def leaves(error: BaseException) -> list[BaseException]:
+        inner = getattr(error, "exceptions", None)
+        return [leaf for child in inner for leaf in leaves(child)] if inner else [error]
+
+    assert any(isinstance(leaf, PermissionError) for leaf in leaves(raised.value))
+    assert "already in use" not in capsys.readouterr().err
 
 
 @pytest.mark.anyio

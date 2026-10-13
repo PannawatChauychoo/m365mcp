@@ -284,7 +284,7 @@ async def test_get_messages_retries_throttled_items(monkeypatch: pytest.MonkeyPa
                     {
                         "id": inner["id"],
                         "status": 429,
-                        "headers": {"Retry-After": "7"},
+                        "headers": {"Retry-After": "5"},
                         "body": {"error": {"code": "TooManyRequests", "message": "slow down"}},
                     }
                 )
@@ -311,7 +311,7 @@ async def test_get_messages_retries_throttled_items(monkeypatch: pytest.MonkeyPa
 
     # Only the throttled items are resent, and Retry-After is honoured.
     assert batch_sizes == [3, 2, 1, 1]
-    assert sleeps == [7.0, 7.0, 7.0]
+    assert sleeps == [5.0, 5.0, 5.0]
     assert attempts == {"m0": 1, "m1": 2, "m2": 4}
     assert result.messages[0].message.id == "m0"
     assert result.messages[1].message.id == "m1"
@@ -328,6 +328,146 @@ def test_batch_retry_after_is_bounded() -> None:
     # Missing or unparseable Retry-After backs off exponentially.
     assert wait({}, 0) == 1.0
     assert wait({"headers": {"Retry-After": "soon"}}, 2) == 4.0
+    # HTTP-date form is not parsed; fall back to backoff.
+    assert wait({"headers": {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}}, 1) == 2.0
+    assert wait({"headers": {"Retry-After": "nan"}}, 0) == 1.0
+
+
+def _message_response(inner: dict[str, object], message_id: str) -> dict[str, object]:
+    return {
+        "id": inner["id"],
+        "status": 200,
+        "body": {
+            "id": message_id,
+            "subject": "",
+            "bodyPreview": "",
+            "isDraft": False,
+            "body": {"contentType": "text", "content": message_id},
+        },
+    }
+
+
+def _inner_message_id(inner: dict[str, object]) -> str:
+    return str(inner["url"]).split("/messages/", 1)[1].split("?", 1)[0]
+
+
+@pytest.mark.anyio
+async def test_get_messages_retry_waits_share_one_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(graph_module.anyio, "sleep", fake_sleep)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "responses": [
+                    {"id": inner["id"], "status": 429, "headers": {"Retry-After": "30"}}
+                    for inner in payload["requests"]
+                ]
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    graph = MicrosoftGraphClient(StaticAuthService(), client)
+
+    result = await graph.get_messages(messageIds=[f"m{index}" for index in range(50)])
+
+    # Three chunks, each always throttled: the waits across all of them stay
+    # inside one per-call budget instead of 3 x 3 x 30 s.
+    assert sum(sleeps) <= graph_module.BATCH_RETRY_BUDGET_SECONDS
+    assert all(item.error and "429" in item.error for item in result.messages)
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_get_messages_keeps_other_chunks_when_a_batch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(graph_module.anyio, "sleep", fake_sleep)
+    calls = {"second_chunk": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        ids = [_inner_message_id(inner) for inner in payload["requests"]]
+        if "m25" in ids:
+            calls["second_chunk"] += 1
+            if calls["second_chunk"] == 1:
+                # The whole $batch POST is throttled once, then succeeds.
+                return httpx.Response(
+                    429,
+                    headers={"Retry-After": "2"},
+                    json={"error": {"code": "TooManyRequests", "message": "slow down"}},
+                )
+        if "m45" in ids:
+            return httpx.Response(
+                500, json={"error": {"code": "InternalServerError", "message": "boom"}}
+            )
+        return httpx.Response(
+            200,
+            json={
+                "responses": [
+                    _message_response(inner, _inner_message_id(inner))
+                    for inner in payload["requests"]
+                ]
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    graph = MicrosoftGraphClient(StaticAuthService(), client)
+
+    ids = [f"m{index}" for index in range(50)]
+    result = await graph.get_messages(messageIds=ids)
+
+    assert [item.messageId for item in result.messages] == ids
+    # First chunk read normally; second chunk retried after an outer 429.
+    assert all(item.message is not None for item in result.messages[:40])
+    assert sleeps == [2.0]
+    # Third chunk failed outright: per-item errors, nothing raised.
+    for item in result.messages[40:]:
+        assert item.message is None
+        assert "500" in item.error and "InternalServerError" in item.error
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_get_messages_rejects_empty_ids_and_survives_bad_items() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        responses = []
+        for inner in payload["requests"]:
+            message_id = _inner_message_id(inner)
+            if message_id == "odd":
+                # A 2xx that is not a message (e.g. a collection).
+                responses.append({"id": inner["id"], "status": 200, "body": {"value": []}})
+            else:
+                responses.append(_message_response(inner, message_id))
+        return httpx.Response(200, json={"responses": responses})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    graph = MicrosoftGraphClient(StaticAuthService(), client)
+
+    for bad in ([""], ["m1", "  "]):
+        with pytest.raises(ValueError, match="empty"):
+            await graph.get_messages(messageIds=bad)
+
+    result = await graph.get_messages(messageIds=["m1", "odd", "m2"])
+    assert result.messages[0].message.id == "m1"
+    assert result.messages[1].message is None
+    assert "Could not read message" in result.messages[1].error
+    assert result.messages[2].message.id == "m2"
+    await client.aclose()
 
 
 @pytest.mark.anyio
@@ -338,6 +478,9 @@ async def test_get_message_returns_full_body_for_forwards() -> None:
             "fw": "FW: Rent roll",
             "fwd": "Fwd: Rent roll",
             "re-fw": "RE: [EXT] Fw: Rent roll",
+            "wg": "AW: WG: Mietliste",
+            "tr": "TR: Liste des loyers",
+            "rv": "RV: Lista de alquileres",
             "reply": "RE: Rent roll forward plan",
         }
         return httpx.Response(
@@ -358,7 +501,7 @@ async def test_get_message_returns_full_body_for_forwards() -> None:
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     graph = MicrosoftGraphClient(StaticAuthService(), client)
 
-    for message_id in ("fw", "fwd", "re-fw"):
+    for message_id in ("fw", "fwd", "re-fw", "wg", "tr", "rv"):
         forwarded = await graph.get_message(messageId=message_id)
         assert forwarded.message.bodyScope == "full", message_id
         assert "Rent roll attached." in forwarded.message.body.content
@@ -1902,4 +2045,35 @@ async def test_list_and_create_events_and_graph_errors() -> None:
     with pytest.raises(RuntimeError, match="ErrorItemNotFound: No such message"):
         await graph.get_message(messageId="bad-id")
 
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_add_and_remove_categories_read_only_categories() -> None:
+    patches: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            assert request.url.params["$select"] == "categories"
+            return httpx.Response(200, json={"id": "msg-1", "categories": ["A", "B"]})
+        if request.method == "PATCH":
+            body = json.loads(request.content)
+            patches.append(body["categories"])
+            return httpx.Response(
+                200,
+                json={
+                    "id": "msg-1",
+                    "subject": "",
+                    "bodyPreview": "",
+                    "isDraft": False,
+                    "categories": body["categories"],
+                },
+            )
+        raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    graph = MicrosoftGraphClient(StaticAuthService(), client)
+    await graph.add_message_categories(messageId="msg-1", categories=["B", "C"])
+    await graph.remove_message_categories(messageId="msg-1", categories=["A"])
+    assert patches == [["A", "B", "C"], ["B"]]
     await client.aclose()

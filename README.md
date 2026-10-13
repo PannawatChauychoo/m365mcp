@@ -439,7 +439,7 @@ Excel workbooks:
 - Prefer `mail_check_inbox` or `mail_list` filters for fast inbox triage. `mail_search` uses Microsoft Graph `$search`, which can be slower on large mailboxes.
 - `mail_get_thread` asks Graph for the thread sorted by received time with `$top` (one request; the filter leads with a no-op `receivedDateTime` bound because Graph only allows `$orderby` with `$filter` when the sorted property is filtered first). `truncated` is set when the thread has more messages, and `messageCount` is then null.
 - `mail_get` and `mail_get_messages` return plain-text bodies holding only the part new to each message (Graph `uniqueBody`) by default, falling back to the full body when Graph has no separate new part and for forwards (`FW:`/`Fwd:`); `bodyScope="full"` and `bodyFormat="html"` restore the full HTML body.
-- `mail_get_messages` uses Graph `$batch` (20 per request) and retries throttled (429) or unavailable (503/504) items up to 3 times, waiting for Graph's `Retry-After` (capped at 30 seconds).
+- `mail_get_messages` uses Graph `$batch` (20 per request) and retries throttled (429) or unavailable (503/504) items up to 3 times, waiting for Graph's `Retry-After` (capped at 30 seconds, and at 20 seconds of waiting per call in total). A failed `$batch` request, including a throttled one, becomes a per-message error for that chunk instead of failing the whole call.
 - `mail_update_category` can update an Outlook master category color. Microsoft Graph does not support renaming an existing master category; create a new category and delete the old one only after confirming that is safe.
 
 ### Behaviour changes for existing callers

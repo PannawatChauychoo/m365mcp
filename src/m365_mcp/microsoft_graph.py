@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import math
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -112,13 +113,19 @@ MAIL_GET_MESSAGES_LIMIT = 50
 BATCH_THROTTLE_RETRIES = 3
 BATCH_RETRY_STATUSES = {429, 503, 504}
 BATCH_MAX_RETRY_AFTER_SECONDS = 30.0
+# Total time one call may spend waiting between retries, across every
+# 20-item chunk, so a tool call finishes well inside MCP client timeouts.
+BATCH_RETRY_BUDGET_SECONDS = 20.0
 # Graph only accepts $orderby with $filter when the sorted property is
 # filtered first, so thread reads lead with this no-op bound.
 THREAD_DATE_FLOOR = "receivedDateTime ge 1900-01-01T00:00:00Z"
 # "FW:", "Fwd:", "[EXT] FW:", "RE: FW:"... Forwarded content is not part of
 # uniqueBody, so these always get the full body.
+# Localized forward prefixes: WG (German), TR (French), RV (Spanish),
+# VB (Swedish), VS (Finnish/Norwegian).
 _FORWARD_SUBJECT_RE = re.compile(
-    r"^\s*(?:\[[^\]]*\]\s*|(?:re|aw|sv)\s*:\s*)*fwd?\s*:", re.IGNORECASE
+    r"^\s*(?:\[[^\]]*\]\s*|(?:re|aw|sv|antw|r)\s*:\s*)*(?:fwd?|wg|tr|rv|vb|vs)\s*:",
+    re.IGNORECASE,
 )
 _HTML_TAG_RE = re.compile(
     r"<(head|style|script)\b.*?</\1\s*>|<[^>]*>", re.IGNORECASE | re.DOTALL
@@ -231,6 +238,15 @@ SAFE_ATTACHMENT_EXTENSIONS = {
     ".html",
     ".htm",
 }
+
+
+class GraphRequestError(RuntimeError):
+    """A Graph request returned a non-2xx status."""
+
+    def __init__(self, message: str, *, status: int, retry_after: str | None = None):
+        super().__init__(message)
+        self.status = status
+        self.retry_after = retry_after
 
 
 class MicrosoftGraphClient:
@@ -406,6 +422,8 @@ class MicrosoftGraphClient:
                 f"mail_get_messages reads at most {MAIL_GET_MESSAGES_LIMIT} "
                 f"messages per call; got {len(messageIds)}"
             )
+        if any(not str(message_id or "").strip() for message_id in messageIds):
+            raise ValueError("messageIds must not contain empty values")
         normalized_mailbox = self._normalize_mailbox(mailbox)
         base = self._base_path(normalized_mailbox)
         prefer = self._message_body_prefer(bodyFormat)
@@ -428,14 +446,20 @@ class MicrosoftGraphClient:
             if error is not None or response is None:
                 items.append(MailGetMessagesItem(messageId=message_id, error=error))
                 continue
-            items.append(
-                MailGetMessagesItem(
-                    messageId=message_id,
-                    message=self._map_full_message(
-                        response.get("body") or {}, bodyScope=bodyScope
-                    ),
+            body = response.get("body")
+            try:
+                if not isinstance(body, dict) or not body.get("id"):
+                    raise ValueError("Graph returned no message")
+                message = self._map_full_message(body, bodyScope=bodyScope)
+            except Exception as mapping_error:
+                items.append(
+                    MailGetMessagesItem(
+                        messageId=message_id,
+                        error=f"Could not read message: {mapping_error}",
+                    )
                 )
-            )
+                continue
+            items.append(MailGetMessagesItem(messageId=message_id, message=message))
         return MailGetMessagesResult(
             mailbox=normalized_mailbox or "me",
             messages=items,
@@ -1406,8 +1430,7 @@ class MicrosoftGraphClient:
         messageId: str,
         categories: list[str],
     ) -> MailUpdateMessageResult:
-        current = await self.get_message(mailbox=mailbox, messageId=messageId)
-        existing = list(current.message.categories)
+        existing = await self._message_categories(mailbox, messageId)
         for category in categories:
             if category not in existing:
                 existing.append(category)
@@ -1424,15 +1447,20 @@ class MicrosoftGraphClient:
         messageId: str,
         categories: list[str],
     ) -> MailUpdateMessageResult:
-        current = await self.get_message(mailbox=mailbox, messageId=messageId)
+        current = await self._message_categories(mailbox, messageId)
         remove = set(categories)
         return await self.set_message_categories(
             mailbox=mailbox,
             messageId=messageId,
-            categories=[
-                category for category in current.message.categories if category not in remove
-            ],
+            categories=[category for category in current if category not in remove],
         )
+
+    async def _message_categories(self, mailbox: str | None, messageId: str) -> list[str]:
+        base = self._base_path(self._normalize_mailbox(mailbox))
+        result = await self._request(
+            f"{base}/messages/{quote(messageId, safe='')}?$select=categories"
+        )
+        return list((result or {}).get("categories") or [])
 
     async def clear_message_categories(
         self,
@@ -2183,8 +2211,10 @@ class MicrosoftGraphClient:
                 else None
             )
             detail = f"{error_code}: {error_message}" if error_code else error_message
-            raise RuntimeError(
-                f"Microsoft Graph request failed ({response.status_code}): {detail}"
+            raise GraphRequestError(
+                f"Microsoft Graph request failed ({response.status_code}): {detail}",
+                status=response.status_code,
+                retry_after=response.headers.get("Retry-After"),
             )
 
         return data
@@ -2195,18 +2225,34 @@ class MicrosoftGraphClient:
         """Send Graph ``POST /$batch`` requests, chunked to 20 per call.
 
         Each entry is ``{"id", "method", "url", "headers"?}`` with ``url``
-        relative to ``/v1.0``. Returns raw inner responses keyed by id."""
+        relative to ``/v1.0``. Returns raw inner responses keyed by id.
+
+        Never raises for a Graph or network failure: if a whole chunk fails,
+        each of its requests gets a synthetic response carrying the error,
+        so results already read in other chunks are kept."""
         responses: dict[str, dict[str, Any]] = {}
+        budget = BATCH_RETRY_BUDGET_SECONDS
         for start in range(0, len(requests), 20):
             pending = requests[start : start + 20]
             # Every sub-request hits the same mailbox, so per-item throttling
             # is common; retry those, honouring Retry-After, before giving up.
             for attempt in range(BATCH_THROTTLE_RETRIES + 1):
-                data = await self._request(
-                    "/$batch", method="POST", json_body={"requests": pending}
-                )
-                for response in (data or {}).get("responses", []):
-                    responses[str(response.get("id"))] = response
+                try:
+                    data = await self._request(
+                        "/$batch", method="POST", json_body={"requests": pending}
+                    )
+                except (GraphRequestError, httpx.HTTPError) as error:
+                    status = getattr(error, "status", None)
+                    for request in pending:
+                        responses[str(request["id"])] = {
+                            "id": request["id"],
+                            "status": status,
+                            "headers": {"Retry-After": getattr(error, "retry_after", None)},
+                            "error": str(error) or type(error).__name__,
+                        }
+                else:
+                    for response in (data or {}).get("responses", []):
+                        responses[str(response.get("id"))] = response
                 throttled = [
                     request
                     for request in pending
@@ -2215,12 +2261,14 @@ class MicrosoftGraphClient:
                 ]
                 if not throttled or attempt == BATCH_THROTTLE_RETRIES:
                     break
-                await anyio.sleep(
-                    max(
-                        self._retry_after_seconds(responses[str(request["id"])], attempt)
-                        for request in throttled
-                    )
+                wait = max(
+                    self._retry_after_seconds(responses[str(request["id"])], attempt)
+                    for request in throttled
                 )
+                if wait > budget:
+                    break
+                budget -= wait
+                await anyio.sleep(wait)
                 pending = throttled
         return responses
 
@@ -2236,6 +2284,8 @@ class MicrosoftGraphClient:
             seconds = float(value) if value is not None else 2.0**attempt
         except (TypeError, ValueError):
             seconds = 2.0**attempt
+        if not math.isfinite(seconds):
+            seconds = 2.0**attempt
         return min(max(seconds, 0.0), BATCH_MAX_RETRY_AFTER_SECONDS)
 
     @staticmethod
@@ -2243,6 +2293,8 @@ class MicrosoftGraphClient:
         """Error text for a failed inner ``$batch`` response, else None."""
         if response is None:
             return "no response returned for this request"
+        if response.get("error"):
+            return str(response["error"])
         status = response.get("status")
         if isinstance(status, int) and 200 <= status < 300:
             return None

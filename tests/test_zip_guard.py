@@ -101,3 +101,55 @@ def test_counts_media_parts_against_the_size_limits() -> None:
     content = _zip({"word/document.xml": b"<w:document/>", "word/media/big.svg": b"\0" * 2_000_000})
     with pytest.raises(ZipGuardError, match="compression ratio"):
         _check(content)
+
+
+CONTENT_TYPES = (
+    b'<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    b'<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+    b'<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+    b'<Default Extension="xml" ContentType="application/xml"/>'
+    b'<Default Extension="svg" ContentType="image/svg+xml"/>'
+    b'<Default Extension="html" ContentType="text/html"/>'
+    b"%s"
+    b"</Types>"
+)
+MAIN_XML = "application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"
+
+
+def test_refuses_a_doctype_in_a_part_declared_as_xml_under_another_name() -> None:
+    # Readers pick a part's parser by content type, not name: a media-named
+    # part overridden to the main document type is parsed as XML.
+    override = f'<Override PartName="/word/media/evil.svg" ContentType="{MAIN_XML}"/>'
+    content = _zip(
+        {
+            "[Content_Types].xml": CONTENT_TYPES % override.encode(),
+            "word/media/evil.svg": b"<!DOCTYPE x [<!ENTITY a 'b'>]><w:document/>",
+        }
+    )
+    with pytest.raises(ZipGuardError, match="document type declaration"):
+        _check(content)
+
+
+def test_refuses_a_doctype_in_an_extension_declared_as_xml() -> None:
+    default = f"<Default Extension='bin' ContentType='{MAIN_XML}'/>"
+    content = _zip(
+        {
+            "[Content_Types].xml": CONTENT_TYPES % default.encode(),
+            "word/document.bin": b"<!DOCTYPE x><w:document/>",
+        }
+    )
+    with pytest.raises(ZipGuardError, match="document type declaration"):
+        _check(content)
+
+
+def test_declared_image_and_html_parts_may_carry_a_doctype() -> None:
+    _check(
+        _zip(
+            {
+                "[Content_Types].xml": CONTENT_TYPES % b"",
+                "word/document.xml": b"<w:document/>",
+                "word/media/image1.svg": SVG_WITH_DOCTYPE,
+                "word/afchunk.html": b"<!DOCTYPE html><html><body>Hi</body></html>",
+            }
+        )
+    )

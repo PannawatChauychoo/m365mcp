@@ -141,6 +141,36 @@ async def test_list_messages_filters_by_date_sorts_and_pages() -> None:
     assert second.hasMore is False
     assert second.nextCursor is None
 
+    # A cursor is tied to the query that produced it: changing the filter,
+    # order, or folder would make Graph's scanned-item $skip skip or repeat.
+    requests_before = len(requests)
+    for changed in (
+        {"inferenceClassification": "other"},
+        {"order": "oldest"},
+        {"folder": "Archive"},
+        {"mailbox": "shared@example.com"},
+        {"receivedAfter": "2026-10-02"},
+    ):
+        arguments: dict[str, object] = {
+            "top": 2,
+            "inferenceClassification": "focused",
+            "receivedAfter": "2026-10-01",
+            "receivedBefore": "2026-10-07T09:00:00-05:00",
+            **changed,
+        }
+        with pytest.raises(ValueError, match="different mail_list arguments"):
+            await graph.list_messages(cursor=first.nextCursor, **arguments)
+    assert len(requests) == requests_before
+    # Page size is not part of the query identity.
+    await graph.list_messages(
+        top=5,
+        inferenceClassification="focused",
+        receivedAfter="2026-10-01",
+        receivedBefore="2026-10-07T09:00:00-05:00",
+        cursor=first.nextCursor,
+    )
+    assert requests[-1].url.params["$skip"] == "7"
+
     await graph.list_messages(top=2, order="oldest")
     params = requests[-1].url.params
     assert params["$orderby"] == "receivedDateTime asc"
@@ -159,7 +189,15 @@ async def test_list_messages_filters_by_date_sorts_and_pages() -> None:
         await graph.list_messages(receivedAfter="2026-10-07", receivedBefore="2026-10-01")
     with pytest.raises(ValueError, match="order"):
         await graph.list_messages(order="latest")
-    for bad_cursor in ("not-a-cursor", base64.urlsafe_b64encode(b"$filter=x").decode()):
+    for bad_cursor in (
+        "not-a-cursor",
+        base64.urlsafe_b64encode(b"$filter=x").decode(),
+        # No scope fingerprint.
+        base64.urlsafe_b64encode(b"$skip=7").decode(),
+        # Non-ASCII digits pass str.isdigit() but not Graph.
+        base64.urlsafe_b64encode("$skip=\u00b2&scope=abc".encode()).decode(),
+        base64.urlsafe_b64encode(b"$skip=7&$skip=8&scope=abc").decode(),
+    ):
         with pytest.raises(ValueError, match="cursor"):
             await graph.list_messages(cursor=bad_cursor)
 
@@ -196,6 +234,9 @@ def test_graph_datetime_normalizes_to_utc(value: str, expected: str) -> None:
         ("2026-13-01", "ISO 8601"),
         ("2026-10-01T25:00:00Z", "ISO 8601"),
         ("2026-10-01T09:00:00+24:00", "ISO 8601"),
+        ("2026-10-01T09:00:00+05:99", "ISO 8601"),
+        # Graph's DateTimeOffset holds at most 7 fractional digits.
+        ("2026-10-01T09:00:00.12345678Z", "ISO 8601"),
         ("9999-12-31T23:00:00-05:00", "ISO 8601"),
         ("0999-01-01", "1900 or later"),
         ("1899-12-31", "1900 or later"),
@@ -227,7 +268,9 @@ async def test_list_messages_compares_fractional_bounds_numerically() -> None:
 
 
 def test_mail_list_cursor_only_from_graph_links() -> None:
-    next_cursor = MicrosoftGraphClient._mail_list_next_cursor
+    def next_cursor(link: str | None) -> str | None:
+        return MicrosoftGraphClient._mail_list_next_cursor(link, "scope1")
+
     assert next_cursor(None) is None
     assert next_cursor("https://example.com/v1.0/me/messages?$skip=7") is None
     assert next_cursor("http://graph.microsoft.com/v1.0/me/messages?$skip=7") is None
@@ -235,7 +278,56 @@ def test_mail_list_cursor_only_from_graph_links() -> None:
     cursor = next_cursor(
         "https://graph.microsoft.com/v1.0/me/messages?$top=5&$skiptoken=abc%3D"
     )
-    assert MicrosoftGraphClient._mail_list_cursor_params(cursor) == {"$skiptoken": "abc="}
+    assert MicrosoftGraphClient._mail_list_cursor_params(cursor) == (
+        {"$skiptoken": "abc="},
+        "scope1",
+    )
+
+
+@pytest.mark.anyio
+async def test_mail_list_cursor_values_stay_inside_one_parameter() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        body: dict[str, object] = {"value": []}
+        if "$skiptoken" not in request.url.params:
+            body["@odata.nextLink"] = (
+                "https://graph.microsoft.com/v1.0/me/mailFolders('Inbox')/messages"
+                "?$skiptoken=a%26%24filter%3Dx%23y"
+            )
+        return httpx.Response(200, json=body)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    graph = MicrosoftGraphClient(StaticAuthService(), client)
+    first = await graph.list_messages(isRead=False)
+    await graph.list_messages(isRead=False, cursor=first.nextCursor)
+    params = requests[-1].url.params
+    assert params["$skiptoken"] == "a&$filter=x#y"
+    assert params["$filter"] == (
+        "receivedDateTime ge 1900-01-01T00:00:00Z and isRead eq false"
+    )
+    await client.aclose()
+
+
+@pytest.mark.anyio
+async def test_mail_list_has_more_only_with_a_usable_cursor() -> None:
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                json={
+                    "value": [],
+                    "@odata.nextLink": "https://example.com/v1.0/me/messages?$skip=5",
+                },
+            )
+        )
+    )
+    graph = MicrosoftGraphClient(StaticAuthService(), client)
+    result = await graph.list_messages()
+    assert result.nextCursor is None
+    assert result.hasMore is False
+    await client.aclose()
 
 
 @pytest.mark.anyio

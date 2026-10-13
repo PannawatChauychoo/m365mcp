@@ -3,11 +3,13 @@
 Word and Excel files are zip archives. A zip's directory declares each
 member's size, but an attacker controls those numbers, so this module
 actually inflates every member, counting real bytes against a size limit
-and a compression-ratio limit, and caps the member count. It also refuses
-any XML document type declaration: Office never writes one, and
-entity-expansion attacks need one, so this guard holds whichever XML parser
-the reader library ends up using. The declaration is matched in UTF-8 and
-UTF-16, the encodings XML parsers detect.
+and a compression-ratio limit, and caps the member count. As defence in
+depth beside the parsers' own settings, it also refuses an XML document
+type declaration in the XML parts (``.xml``/``.rels``): Office never writes
+one there, and entity-expansion attacks need one. Media is not scanned,
+because SVG images and altChunk HTML legitimately start with ``<!DOCTYPE``
+and the readers never parse them as XML. The declaration is matched in
+UTF-8 and UTF-16 (not UTF-32).
 
 Callers turn ``ZipGuardError`` into their own reason type.
 """
@@ -21,6 +23,7 @@ _DOCTYPE_PATTERNS = tuple(
     "<!DOCTYPE".encode(encoding) for encoding in ("utf-8", "utf-16-le", "utf-16-be")
 )
 _TAIL_BYTES = max(len(pattern) for pattern in _DOCTYPE_PATTERNS) - 1
+_XML_PART_SUFFIXES = (".xml", ".rels")
 _CHUNK_BYTES = 1 << 20
 
 
@@ -52,8 +55,16 @@ def check_zip_archive(
     except Exception as error:
         raise ZipGuardError(f"{label} archive is damaged: {error}") from error
 
-    limit = min(max_inflated_bytes, max(len(content), 1) * max_ratio)
-    too_large = ZipGuardError(f"{label} expands to more than {limit} bytes and was not opened")
+    ratio_limit = max(len(content), 1) * max_ratio
+    limit = min(max_inflated_bytes, ratio_limit)
+    if ratio_limit < max_inflated_bytes:
+        too_large = ZipGuardError(
+            f"{label} expands to more than {max_ratio}x its compressed size "
+            f"({limit} bytes), a compression ratio Office files do not reach; "
+            "it was not opened"
+        )
+    else:
+        too_large = ZipGuardError(f"{label} expands to more than {limit} bytes and was not opened")
     with archive:
         members = archive.infolist()
         if len(members) > max_members:
@@ -68,6 +79,7 @@ def check_zip_archive(
         for info in members:
             if info.is_dir():
                 continue
+            scan_doctype = info.filename.lower().endswith(_XML_PART_SUFFIXES)
             try:
                 with archive.open(info) as member:
                     tail = b""
@@ -75,6 +87,8 @@ def check_zip_archive(
                         inflated += len(chunk)
                         if inflated > limit:
                             raise too_large
+                        if not scan_doctype:
+                            continue
                         window = tail + chunk
                         if any(pattern in window for pattern in _DOCTYPE_PATTERNS):
                             raise ZipGuardError(

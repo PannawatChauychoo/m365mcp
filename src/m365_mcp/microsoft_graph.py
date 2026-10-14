@@ -246,7 +246,12 @@ DEFAULT_PDF_MAX_BYTES = 25_000_000
 # Attachment metadata without contentBytes: without $select Graph inlines the
 # whole file as base64, so a size check would come after the download it is
 # meant to bound. The bytes are then streamed from /$value with a cutoff.
-ATTACHMENT_METADATA_SELECT = "id,name,contentType,size,isInline,lastModifiedDateTime"
+# contentId lives on fileAttachment, not the base attachment type, so it needs
+# the type cast; a bare "contentId" is a 400.
+ATTACHMENT_METADATA_SELECT = (
+    "id,name,contentType,size,isInline,lastModifiedDateTime,"
+    "microsoft.graph.fileAttachment/contentId"
+)
 # Graph's attachment size counts the item's properties as well as the file,
 # so the up-front refusal allows this much over maxBytes; the streamed
 # download still stops at exactly maxBytes.

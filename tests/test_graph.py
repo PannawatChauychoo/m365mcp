@@ -3589,6 +3589,9 @@ async def test_attachment_downloads_stop_at_max_bytes(
     # The metadata request names its fields, so it never carries the file.
     assert metadata_selects and metadata_selects[0]
     assert "contentBytes" not in metadata_selects[0]
+    # contentId is selected through the fileAttachment cast, so inline images
+    # still match the body's cid: references.
+    assert "microsoft.graph.fileAttachment/contentId" in metadata_selects[0]
 
     await client.aclose()
 
